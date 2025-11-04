@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 const MAX_MAP_RANGE: u32 = (1 << 24) - 1; // 0xFFFFFF
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CMap {
     codespace_ranges: [Vec<u32>; 4],
     map: HashMap<u32, u32>,
@@ -42,6 +42,10 @@ impl CMap {
 
     pub(crate) fn is_vertical(&self) -> bool {
         self.vertical
+    }
+
+    pub(crate) fn is_identity_cmap(&self) -> bool {
+        (self.name == "Identity-H" || self.name == "Identity-V") && self.map.is_empty()
     }
 
     pub(crate) fn lookup_code(&self, code: u32) -> Option<u32> {
@@ -126,10 +130,6 @@ impl CMap {
 
     fn map_one(&mut self, src: u32, dst: u32) {
         self.map.insert(src, dst);
-    }
-
-    fn is_identity_cmap(&self) -> bool {
-        (self.name == "Identity-H" || self.name == "Identity-V") && self.map.is_empty()
     }
 
     pub fn read_code(&self, bytes: &[u8], offset: usize) -> (u32, usize) {

@@ -23,6 +23,7 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true, features = ["png"] }
+colog = "1.4.0"
 
 [features]
 default = ["embed-fonts"]

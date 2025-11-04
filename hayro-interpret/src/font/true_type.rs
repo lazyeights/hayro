@@ -1,5 +1,6 @@
 use crate::CacheKey;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
+use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::generated::{glyph_names, mac_os_roman, mac_roman};
 use crate::font::{Encoding, FontFlags};
 use crate::util::{CodeMapExt, OptionLog};
@@ -19,6 +20,8 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use log::info;
+
 #[derive(Debug)]
 pub(crate) struct TrueTypeFont {
     cache_key: u128,
@@ -32,6 +35,7 @@ pub(crate) struct TrueTypeFont {
     cff_blob: Option<CffFontBlob>,
     differences: HashMap<u8, String>,
     cached_mappings: RefCell<HashMap<u8, GlyphId>>,
+    to_unicode: Option<CMap>,
 }
 
 impl TrueTypeFont {
@@ -66,6 +70,15 @@ impl TrueTypeFont {
             .ok()
             .and_then(|cff| CffFontBlob::new(Arc::new(cff.offset_data().as_ref().to_vec())));
 
+        // Parse ToUnicode CMap if present
+        let to_unicode = dict
+            .get::<Stream>(TO_UNICODE)
+            .and_then(|s| s.decoded().ok())
+            .and_then(|data| {
+                let cmap_str = std::str::from_utf8(&data).ok()?;
+                parse_cmap(cmap_str)
+            });
+
         Some(Self {
             base_font,
             cache_key,
@@ -76,6 +89,7 @@ impl TrueTypeFont {
             font_flags,
             encoding,
             cached_mappings: RefCell::new(HashMap::new()),
+            to_unicode,
         })
     }
 
@@ -217,6 +231,40 @@ impl TrueTypeFont {
             })
             .warn_none(&format!("failed to find advance width for code {code}"))
             .unwrap_or(0.0)
+    }
+
+    pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
+        info!("{:?}", self);
+
+        // 1. Try ToUnicode CMap (highest priority)
+        if let Some(to_unicode) = &self.to_unicode {
+            if let Some(unicode) = to_unicode.lookup_code(char_code) {
+                return char::from_u32(unicode);
+            }
+        }
+
+        let code = char_code as u8;
+
+        // 2. Try glyph name → Unicode (via encoding)
+        if let Some(glyph_name) = self.code_to_name(code) {
+            // Try Adobe Glyph List
+            if let Some(unicode_str) = glyph_names::get(glyph_name) {
+                return unicode_str.chars().next();
+            }
+
+            // Try Unicode naming conventions (uni0041, u0041)
+            if glyph_name.starts_with("uni") && glyph_name.len() >= 7 {
+                if let Ok(code_point) = u32::from_str_radix(&glyph_name[3..7], 16) {
+                    return char::from_u32(code_point);
+                }
+            } else if glyph_name.starts_with("u") && glyph_name.len() >= 5 {
+                if let Ok(code_point) = u32::from_str_radix(&glyph_name[1..5], 16) {
+                    return char::from_u32(code_point);
+                }
+            }
+        }
+
+        None
     }
 }
 

@@ -23,6 +23,7 @@ pub(crate) struct Type0Font {
     dw2: (f32, f32),
     widths: HashMap<u32, f32>,
     encoding: CMap,
+    to_unicode: Option<CMap>,
     widths2: HashMap<u32, [f32; 3]>,
     cid_to_gid_map: CidToGIdMap,
 }
@@ -54,10 +55,19 @@ impl Type0Font {
         let cid_to_gid_map = CidToGIdMap::new(&descendant_font).unwrap_or_default();
         let cache_key = dict.cache_key();
 
+        let to_unicode = dict
+            .get::<Stream>(TO_UNICODE)
+            .and_then(|s| s.decoded().ok())
+            .and_then(|data| {
+                let cmap_str = std::str::from_utf8(&data).ok()?;
+                parse_cmap(cmap_str)
+            });
+
         Some(Self {
             cache_key,
             horizontal,
             encoding: cmap,
+            to_unicode,
             font_type,
             dw: default_width,
             dw2,
@@ -133,6 +143,31 @@ impl Type0Font {
         } else {
             Vec2::new(-self.horizontal_width(cid) as f64 / 2.0, -self.dw2.0 as f64)
         }
+    }
+
+    pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
+        // 1. Try ToUnicode CMap (highest priority)
+        if let Some(to_unicode) = &self.to_unicode {
+            if let Some(unicode) = to_unicode.lookup_code(char_code) {
+                return char::from_u32(unicode);
+            }
+        }
+
+        // 2. For Identity-H/Identity-V, the CID often equals Unicode
+        // This is a common pattern for Unicode CMaps
+        if self.encoding.is_identity_cmap() {
+            if let Some(cid) = self.code_to_cid(char_code) {
+                // Try treating CID as Unicode code point
+                if let Some(c) = char::from_u32(cid) {
+                    return Some(c);
+                }
+            }
+        }
+
+        // TODO: Implement CID collection mappings (Adobe-Japan1, Adobe-GB1, etc.)
+        // For now, we don't have built-in CID collection mappings
+
+        None
     }
 }
 

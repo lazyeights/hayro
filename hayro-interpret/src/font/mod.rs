@@ -53,6 +53,28 @@ pub enum Glyph<'a> {
     Type3(Box<Type3Glyph<'a>>),
 }
 
+impl Glyph<'_> {
+    /// Returns the Unicode code point for this glyph, if available.
+    ///
+    /// This method attempts to determine the Unicode character that this glyph
+    /// represents using the following fallback chain:
+    ///
+    /// 1. ToUnicode CMap (if present in font)
+    /// 2. Built-in CID collection mappings (for CID fonts)
+    /// 3. Glyph name → Unicode (via Adobe Glyph List)
+    /// 4. Standard encoding → Unicode
+    /// 5. Font cmap table (for TrueType/OpenType)
+    /// 6. Unicode naming conventions (e.g., "uni0041")
+    ///
+    /// Returns `None` if the Unicode value cannot be determined.
+    pub fn as_unicode(&self) -> Option<char> {
+        match self {
+            Glyph::Outline(g) => g.as_unicode(),
+            Glyph::Type3(g) => g.as_unicode(),
+        }
+    }
+}
+
 /// An identifier that uniquely identifies a glyph, for caching purposes.
 #[derive(Clone, Debug)]
 pub struct GlyphIdentifier {
@@ -71,6 +93,7 @@ impl CacheKey for GlyphIdentifier {
 pub struct OutlineGlyph {
     pub(crate) id: GlyphId,
     pub(crate) font: OutlineFont,
+    pub(crate) char_code: u32,
 }
 
 impl OutlineGlyph {
@@ -90,6 +113,13 @@ impl OutlineGlyph {
             font: self.font.clone(),
         }
     }
+
+    /// Returns the Unicode code point for this glyph, if available.
+    ///
+    /// See [`Glyph::as_unicode`] for details on the fallback chain used.
+    pub fn as_unicode(&self) -> Option<char> {
+        self.font.char_code_to_unicode(self.char_code)
+    }
 }
 
 /// A type3 glyph.
@@ -102,6 +132,7 @@ pub struct Type3Glyph<'a> {
     pub(crate) cache: Cache,
     pub(crate) xref: &'a XRef,
     pub(crate) settings: InterpreterSettings,
+    pub(crate) char_code: u32,
 }
 
 /// A glyph defined by PDF drawing instructions.
@@ -116,6 +147,14 @@ impl<'a> Type3Glyph<'a> {
     ) {
         self.font
             .render_glyph(self, transform, glyph_transform, paint, device);
+    }
+
+    /// Returns the Unicode code point for this glyph, if available.
+    ///
+    /// Note: Type3 fonts can only provide Unicode via ToUnicode CMap.
+    /// See [`Glyph::as_unicode`] for details.
+    pub fn as_unicode(&self) -> Option<char> {
+        self.font.char_code_to_unicode(self.char_code)
     }
 }
 
@@ -181,6 +220,7 @@ impl<'a> Font<'a> {
     pub(crate) fn get_glyph(
         &self,
         glyph: GlyphId,
+        char_code: u32,
         ctx: &mut Context<'a>,
         resources: &Resources<'a>,
         origin_displacement: Vec2,
@@ -192,15 +232,27 @@ impl<'a> Font<'a> {
         let glyph = match &self.1 {
             FontType::Type1(t) => {
                 let font = OutlineFont::Type1(t.clone());
-                Glyph::Outline(OutlineGlyph { id: glyph, font })
+                Glyph::Outline(OutlineGlyph {
+                    id: glyph,
+                    font,
+                    char_code,
+                })
             }
             FontType::TrueType(t) => {
                 let font = OutlineFont::TrueType(t.clone());
-                Glyph::Outline(OutlineGlyph { id: glyph, font })
+                Glyph::Outline(OutlineGlyph {
+                    id: glyph,
+                    font,
+                    char_code,
+                })
             }
             FontType::Type0(t) => {
                 let font = OutlineFont::Type0(t.clone());
-                Glyph::Outline(OutlineGlyph { id: glyph, font })
+                Glyph::Outline(OutlineGlyph {
+                    id: glyph,
+                    font,
+                    char_code,
+                })
             }
             FontType::Type3(t) => {
                 let shape_glyph = Type3Glyph {
@@ -211,6 +263,7 @@ impl<'a> Font<'a> {
                     cache: ctx.object_cache.clone(),
                     xref: ctx.xref,
                     settings: ctx.settings.clone(),
+                    char_code,
                 };
 
                 Glyph::Type3(Box::new(shape_glyph))

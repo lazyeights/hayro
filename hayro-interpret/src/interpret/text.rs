@@ -30,6 +30,7 @@ pub(crate) fn show_text_string<'a>(
 
         let (glyph, glyph_transform) = font.get_glyph(
             font.map_code(code),
+            code,
             ctx,
             resources,
             font.origin_displacement(code),

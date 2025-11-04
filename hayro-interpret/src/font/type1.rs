@@ -1,4 +1,5 @@
 use crate::font::blob::{CffFontBlob, Type1FontBlob};
+use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::generated::glyph_names;
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::standard_font::{StandardFont, StandardFontBlob, select_standard_font};
@@ -7,8 +8,9 @@ use crate::font::{Encoding, FallbackFontQuery, FontQuery};
 use crate::{CacheKey, FontResolverFn};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{FONT_DESC, FONT_FILE, FONT_FILE3};
+use hayro_syntax::object::dict::keys::{FONT_DESC, FONT_FILE, FONT_FILE3, TO_UNICODE};
 use kurbo::{Affine, BezPath};
+use log::info;
 use log::warn;
 use skrifa::GlyphId;
 use std::cell::RefCell;
@@ -16,11 +18,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub(crate) struct Type1Font(u128, Kind);
+pub(crate) struct Type1Font(u128, Kind, Option<CMap>);
 
 impl Type1Font {
     pub(crate) fn new(dict: &Dict, resolver: &FontResolverFn) -> Option<Self> {
         let cache_key = dict.cache_key();
+
+        // Parse ToUnicode CMap if present
+        let to_unicode = dict
+            .get::<Stream>(TO_UNICODE)
+            .and_then(|s| s.decoded().ok())
+            .and_then(|data| {
+                let cmap_str = std::str::from_utf8(&data).ok()?;
+                parse_cmap(cmap_str)
+            });
 
         let fallback = || {
             // TODO: Actually use fallback fonts
@@ -43,20 +54,21 @@ impl Type1Font {
                     true,
                     resolver,
                 )?),
+                to_unicode.clone(),
             ))
         };
 
         let inner = if let Some(standard) = StandardKind::new(dict, resolver) {
-            Self(cache_key, Kind::Standard(standard))
+            Self(cache_key, Kind::Standard(standard), to_unicode)
         } else if is_cff(dict) {
             if let Some(cff) = CffKind::new(dict) {
-                Self(cache_key, Kind::Cff(cff))
+                Self(cache_key, Kind::Cff(cff), to_unicode)
             } else {
                 return fallback();
             }
         } else if is_type1(dict) {
             if let Some(f) = Type1Kind::new(dict) {
-                Self(cache_key, Kind::Type1(f))
+                Self(cache_key, Kind::Type1(f), to_unicode)
             } else {
                 return fallback();
             }
@@ -88,6 +100,25 @@ impl Type1Font {
             Kind::Standard(s) => s.glyph_width(code),
             Kind::Cff(c) => c.glyph_width(code),
             Kind::Type1(t) => t.glyph_width(code),
+        }
+    }
+
+    pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
+        info!("Type1Font::char_code_to_unicode: char_code={}", char_code);
+        // 1. Try ToUnicode CMap (highest priority)
+        if let Some(to_unicode) = &self.2 {
+            if let Some(unicode) = to_unicode.lookup_code(char_code) {
+                info!("Type1Font::char_code_to_unicode: unicode={}", unicode);
+                return char::from_u32(unicode);
+            }
+        }
+
+        // 2. Try glyph name → Unicode (via encoding)
+        let code = char_code as u8;
+        match &self.1 {
+            Kind::Standard(s) => s.char_code_to_unicode(code),
+            Kind::Cff(c) => c.char_code_to_unicode(code),
+            Kind::Type1(t) => t.char_code_to_unicode(code),
         }
     }
 }
@@ -202,6 +233,17 @@ impl StandardKind {
                 .and_then(|c| self.base_font.get_width(c))
         })
     }
+
+    fn char_code_to_unicode(&self, code: u8) -> Option<char> {
+        // Try glyph name → Unicode (via encoding)
+        if let Some(glyph_name) = self.code_to_ps_name(code) {
+            if let Some(unicode_str) = glyph_names::get(glyph_name) {
+                return unicode_str.chars().next();
+            }
+        }
+
+        None
+    }
 }
 
 fn is_cff(dict: &Dict) -> bool {
@@ -277,6 +319,23 @@ impl Type1Kind {
     fn glyph_width(&self, code: u8) -> Option<f32> {
         self.widths.get(code as usize).copied()
     }
+
+    fn char_code_to_unicode(&self, code: u8) -> Option<char> {
+        // Get the glyph name from encoding
+        let glyph_name = if let Some(entry) = self.encodings.get(&code) {
+            Some(entry.as_str())
+        } else {
+            match self.encoding {
+                Encoding::BuiltIn => self.font.table().code_to_string(code),
+                _ => self.encoding.map_code(code),
+            }
+        };
+
+        // Try glyph name → Unicode
+        glyph_name
+            .and_then(|name| glyph_names::get(name))
+            .and_then(|unicode_str| unicode_str.chars().next())
+    }
 }
 
 #[derive(Debug)]
@@ -330,5 +389,23 @@ impl CffKind {
 
     fn glyph_width(&self, code: u8) -> Option<f32> {
         self.widths.get(code as usize).copied()
+    }
+
+    fn char_code_to_unicode(&self, code: u8) -> Option<char> {
+        // Get the glyph name from encoding
+        let glyph_name = if let Some(entry) = self.encodings.get(&code) {
+            Some(entry.as_str())
+        } else {
+            let table = self.font.table();
+            match self.encoding {
+                Encoding::BuiltIn => table.glyph_index(code).and_then(|g| table.glyph_name(g)),
+                _ => self.encoding.map_code(code),
+            }
+        };
+
+        // Try glyph name → Unicode
+        glyph_name
+            .and_then(|name| glyph_names::get(name))
+            .and_then(|unicode_str| unicode_str.chars().next())
     }
 }

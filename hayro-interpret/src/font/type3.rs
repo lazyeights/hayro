@@ -1,5 +1,6 @@
 use crate::context::Context;
 use crate::device::Device;
+use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::true_type::{read_encoding, read_widths};
 use crate::font::{Encoding, Glyph, Type3Glyph, UNITS_PER_EM};
@@ -12,7 +13,7 @@ use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_MATRIX, RESOURCES};
+use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_MATRIX, RESOURCES, TO_UNICODE};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Rect};
 use skrifa::GlyphId;
@@ -27,6 +28,7 @@ pub(crate) struct Type3<'a> {
     char_procs: HashMap<String, Stream<'a>>,
     glyph_simulator: GlyphSimulator,
     matrix: Affine,
+    to_unicode: Option<CMap>,
 }
 
 impl<'a> Type3<'a> {
@@ -52,6 +54,15 @@ impl<'a> Type3<'a> {
             procs
         };
 
+        // Parse ToUnicode CMap if present
+        let to_unicode = dict
+            .get::<Stream>(TO_UNICODE)
+            .and_then(|s| s.decoded().ok())
+            .and_then(|data| {
+                let cmap_str = std::str::from_utf8(&data).ok()?;
+                parse_cmap(cmap_str)
+            });
+
         Self {
             glyph_simulator: GlyphSimulator::new(),
             encoding,
@@ -60,6 +71,7 @@ impl<'a> Type3<'a> {
             encodings,
             matrix,
             dict: dict.clone(),
+            to_unicode,
         }
     }
 
@@ -75,6 +87,17 @@ impl<'a> Type3<'a> {
     pub(crate) fn glyph_width(&self, code: u8) -> f32 {
         (*self.widths.get(code as usize).unwrap_or(&0.0) * self.matrix.as_coeffs()[0] as f32)
             * UNITS_PER_EM
+    }
+
+    pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
+        // Type3 fonts can only provide Unicode via ToUnicode CMap
+        if let Some(to_unicode) = &self.to_unicode {
+            if let Some(unicode) = to_unicode.lookup_code(char_code) {
+                return char::from_u32(unicode);
+            }
+        }
+
+        None
     }
 
     pub(crate) fn render_glyph(
