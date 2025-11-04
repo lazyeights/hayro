@@ -10,7 +10,6 @@ use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
 use hayro_syntax::object::dict::keys::{FONT_DESC, FONT_FILE, FONT_FILE3, TO_UNICODE};
 use kurbo::{Affine, BezPath};
-use log::info;
 use log::warn;
 use skrifa::GlyphId;
 use std::cell::RefCell;
@@ -104,12 +103,14 @@ impl Type1Font {
     }
 
     pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
-        info!("Type1Font::char_code_to_unicode: char_code={}", char_code);
         // 1. Try ToUnicode CMap (highest priority)
         if let Some(to_unicode) = &self.2 {
             if let Some(unicode) = to_unicode.lookup_code(char_code) {
-                info!("Type1Font::char_code_to_unicode: unicode={}", unicode);
-                return char::from_u32(unicode);
+                // Skip null character mappings and fall back to glyph name lookup
+                // Some PDFs have incorrect ToUnicode mappings that map to U+0000
+                if unicode != 0 {
+                    return char::from_u32(unicode);
+                }
             }
         }
 
