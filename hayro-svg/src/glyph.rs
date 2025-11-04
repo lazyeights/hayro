@@ -51,6 +51,10 @@ impl<'a> SvgRenderer<'a> {
                         self.write_stroke_properties(s);
                         self.write_paint(paint, &outline, transform, true);
                     }
+                    GlyphDrawMode::Invisible => {
+                        // Don't render invisible text in SVG output
+                        return;
+                    }
                 }
                 self.xml.end_element();
             }

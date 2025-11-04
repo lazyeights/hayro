@@ -96,7 +96,17 @@ pub(crate) fn show_glyph<'a>(
                 &GlyphDrawMode::Stroke(stroke_props),
             );
         }
-        TextRenderingMode::Invisible => {}
+        TextRenderingMode::Invisible => {
+            // Still call draw_glyph for invisible text - devices like text extractors
+            // need to process invisible glyphs for text extraction
+            device.draw_glyph(
+                glyph,
+                ctx.get().ctm,
+                glyph_transform,
+                &get_paint(ctx, false),
+                &GlyphDrawMode::Invisible,
+            );
+        }
         TextRenderingMode::Clip => {
             clip_glyph(ctx, glyph, glyph_transform);
         }

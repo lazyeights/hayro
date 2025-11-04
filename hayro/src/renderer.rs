@@ -719,6 +719,9 @@ impl<'a> Device<'a> for Renderer {
             GlyphDrawMode::Stroke(s) => {
                 Self::stroke_glyph(self, glyph, transform, glyph_transform, paint, s);
             }
+            GlyphDrawMode::Invisible => {
+                // Don't render invisible text for visual output
+            }
         }
     }
 
