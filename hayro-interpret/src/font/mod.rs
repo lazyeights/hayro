@@ -57,14 +57,19 @@ impl Glyph<'_> {
     /// Returns the Unicode code point for this glyph, if available.
     ///
     /// This method attempts to determine the Unicode character that this glyph
-    /// represents using the following fallback chain:
+    /// represents. The exact fallback chain depends on the font type:
     ///
+    /// **For Outline Fonts (Type1, TrueType, CFF):**
     /// 1. ToUnicode CMap (if present in font)
-    /// 2. Built-in CID collection mappings (for CID fonts)
-    /// 3. Glyph name → Unicode (via Adobe Glyph List)
-    /// 4. Standard encoding → Unicode
-    /// 5. Font cmap table (for TrueType/OpenType)
-    /// 6. Unicode naming conventions (e.g., "uni0041")
+    /// 2. Glyph name → Unicode (via Adobe Glyph List)
+    /// 3. Unicode naming conventions (e.g., "uni0041", "u0041") [TrueType only]
+    ///
+    /// **For CID Fonts (Type0):**
+    /// 1. ToUnicode CMap (if present in font)
+    /// 2. Identity CMap heuristic (treats CID as Unicode code point)
+    ///
+    /// **For Type3 Fonts:**
+    /// 1. ToUnicode CMap (if present in font) - only option
     ///
     /// Returns `None` if the Unicode value cannot be determined.
     pub fn as_unicode(&self) -> Option<char> {
