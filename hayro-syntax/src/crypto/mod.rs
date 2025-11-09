@@ -199,7 +199,7 @@ fn decrypt_aes256(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     let (iv, data) = data.split_at_checked(16)?;
     let iv: [u8; 16] = iv.try_into().ok()?;
     let cipher = AES256Cipher::new(key)?;
-    Some(cipher.decrypt_cbc(data, &iv))
+    Some(cipher.decrypt_cbc(data, &iv, true))
 }
 
 fn decrypt_aes128(key: &[u8], data: &[u8], id: ObjectIdentifier) -> Option<Vec<u8>> {
@@ -211,7 +211,7 @@ fn decrypt_aes128(key: &[u8], data: &[u8], id: ObjectIdentifier) -> Option<Vec<u
         let (iv, data) = data.split_at_checked(16)?;
         let iv: [u8; 16] = iv.try_into().ok()?;
 
-        Some(cipher.decrypt_cbc(data, &iv))
+        Some(cipher.decrypt_cbc(data, &iv, true))
     })
 }
 
@@ -283,8 +283,12 @@ impl DecryptorData {
             }
         }
 
-        let stm_f = *mappings.get(dict.get::<Name>(STM_F)?.as_str())?;
-        let str_f = *mappings.get(dict.get::<Name>(STR_F)?.as_str())?;
+        let stm_f = *mappings
+            .get(dict.get::<Name>(STM_F)?.as_str())
+            .unwrap_or(&CryptDictionary::identity(default_length));
+        let str_f = *mappings
+            .get(dict.get::<Name>(STR_F)?.as_str())
+            .unwrap_or(&CryptDictionary::identity(default_length));
 
         Some(Self {
             stream_filter: stm_f,
@@ -320,6 +324,13 @@ impl CryptDictionary {
             cfm,
             _length: length,
         })
+    }
+
+    fn identity(default_length: u16) -> CryptDictionary {
+        Self {
+            cfm: DecryptorTag::None,
+            _length: default_length,
+        }
     }
 }
 
@@ -612,7 +623,7 @@ fn decryption_key_rev56(
         let cipher = AES256Cipher::new(&intermediate_owner_key).ok_or(InvalidEncryption)?;
         let zero_iv = [0u8; 16];
 
-        Ok(cipher.decrypt_cbc(&oe_string.get(), &zero_iv))
+        Ok(cipher.decrypt_cbc(&oe_string.get(), &zero_iv, false))
     } else if compute_hash_rev56(PASSWORD, user_validation_salt, None, revision)? == user_hash {
         // e) Compute an intermediate user key by computing a hash using algorithm 2.B with an input string
         // consisting of the UTF-8 user password concatenated with the 8 bytes of user Key Salt. The 32-byte result
@@ -629,7 +640,7 @@ fn decryption_key_rev56(
         let cipher = AES256Cipher::new(&intermediate_key).ok_or(InvalidEncryption)?;
         let zero_iv = [0u8; 16];
 
-        Ok(cipher.decrypt_cbc(&ue_string.get(), &zero_iv))
+        Ok(cipher.decrypt_cbc(&ue_string.get(), &zero_iv, false))
     } else {
         Err(DecryptionError::PasswordProtected)
     }

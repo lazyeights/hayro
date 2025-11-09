@@ -11,52 +11,82 @@
 
 use crate::arithmetic_decoder::{ArithmeticDecoder, ArithmeticDecoderContext};
 use crate::codestream::CodeBlockStyle;
-use crate::packet::{CodeBlock, SubbandType};
+use crate::decode::{CodeBlock, Layer, Segment, SubBandType};
+use log::warn;
 
+/// Decode the layers of the given code block into coefficients.
+///
+/// The result will be stored in the form of a vector of signs and magnitudes
+/// in the bitplane decoder context.
 pub(crate) fn decode(
-    code_block: &mut CodeBlock,
-    subband_type: SubbandType,
+    code_block: &CodeBlock,
+    sub_band_type: SubBandType,
     num_bitplanes: u16,
     style: &CodeBlockStyle,
-    ctx: &mut BitplaneDecodeContext,
-    layer_buffer: &mut Vec<u8>,
+    ctx: &mut CodeBlockDecodeContext,
+    layers: &[Layer],
+    all_segments: &[Segment],
 ) -> Result<(), &'static str> {
+    ctx.reset(code_block, sub_band_type, style);
+
     if code_block.number_of_coding_passes == 0 {
         return Ok(());
     }
 
-    ctx.reset(code_block, subband_type);
+    if num_bitplanes > 32 {
+        // If we want to adjust this, we need to change how `ComponentBits`
+        // works.
+        return Err("bitplanes with more than 32 bits are not supported");
+    }
+
+    let mut layer_buffer = std::mem::take(&mut ctx.layer_buffer).unwrap_or_default();
     layer_buffer.clear();
 
-    if style.selective_arithmetic_coding_bypass
-        || style.segmentation_symbols
-        || style.vertically_causal_context
-        || style.predictable_termination
-        || style.termination_on_each_pass
-        || style.reset_context_probabilities
-    {
+    if style.selective_arithmetic_coding_bypass {
         return Err("unsupported code-block style features encountered during decoding");
     }
 
-    for data in &code_block.layer_data {
-        layer_buffer.extend(*data);
-    }
-
-    let mut decoder = ArithmeticDecoder::new(&layer_buffer);
-
-    decode_inner(code_block, num_bitplanes, &mut decoder, ctx)
+    decode_inner(code_block, style, num_bitplanes, layers, all_segments, ctx)
         .ok_or("failed to decode code-block arithmetic data")?;
+
+    ctx.layer_buffer = Some(layer_buffer);
 
     Ok(())
 }
 
 fn decode_inner(
-    code_block: &mut CodeBlock,
+    code_block: &CodeBlock,
+    style: &CodeBlockStyle,
     num_bitplanes: u16,
-    decoder: &mut impl BitDecoder,
-    ctx: &mut BitplaneDecodeContext,
+    layers: &[Layer],
+    all_segments: &[Segment],
+    ctx: &mut CodeBlockDecodeContext,
 ) -> Option<()> {
+    let mut combined_layers = vec![];
+    let mut segment_ranges = vec![0];
+
+    for layer in layers {
+        if let Some(range) = layer.segments.clone() {
+            for segment in &all_segments[range.clone()] {
+                combined_layers.extend(segment.data);
+                segment_ranges.push(combined_layers.len());
+            }
+        }
+    }
+
+    let mut decoder = if style.termination_on_each_pass {
+        ArithmeticDecoder::new(&combined_layers[..segment_ranges[1]])
+    } else {
+        ArithmeticDecoder::new(&combined_layers)
+    };
+
     for coding_pass in 0..code_block.number_of_coding_passes {
+        if coding_pass > 0 && style.termination_on_each_pass {
+            let data = &combined_layers
+                [segment_ranges[coding_pass as usize]..segment_ranges[coding_pass as usize + 1]];
+            decoder = ArithmeticDecoder::new(data);
+        }
+
         enum PassType {
             Cleanup,
             SignificancePropagation,
@@ -74,15 +104,32 @@ fn decode_inner(
 
         match pass {
             PassType::Cleanup => {
-                cleanup_pass(ctx, decoder);
+                cleanup_pass(ctx, &mut decoder);
+
+                if style.segmentation_symbols {
+                    let b0 = decoder.read_bit(ctx.arithmetic_decoder_context(18));
+                    let b1 = decoder.read_bit(ctx.arithmetic_decoder_context(18));
+                    let b2 = decoder.read_bit(ctx.arithmetic_decoder_context(18));
+                    let b3 = decoder.read_bit(ctx.arithmetic_decoder_context(18));
+
+                    if b0 != 1 || b1 != 0 || b2 != 1 || b3 != 0 {
+                        warn!("encountered invalid segmentation symbol");
+                        return None;
+                    }
+                }
+
                 ctx.reset_for_next_bitplane();
             }
             PassType::SignificancePropagation => {
-                significance_propagation_pass(ctx, decoder);
+                significance_propagation_pass(ctx, &mut decoder);
             }
             PassType::MagnitudeRefinement => {
-                magnitude_refinement_pass(ctx, decoder);
+                magnitude_refinement_pass(ctx, &mut decoder);
             }
+        }
+
+        if style.reset_context_probabilities {
+            ctx.reset_contexts();
         }
     }
 
@@ -94,19 +141,10 @@ fn decode_inner(
         }
     }
 
-    // Combine signs and magnitudes into single signed coefficients.
-    for (sign, magnitude) in ctx.signs.iter().zip(&ctx.magnitude_array) {
-        let mut num = magnitude.get() as i16;
-        if *sign != 0 {
-            num = -num;
-        }
-        code_block.coefficients.push(num);
-    }
-
     Some(())
 }
 
-pub(crate) struct BitplaneDecodeContext {
+pub(crate) struct CodeBlockDecodeContext {
     /// The signs of each coefficient.
     signs: Vec<u8>,
     /// The magnitude of each coefficient that is successively built as we advance through the
@@ -125,14 +163,20 @@ pub(crate) struct BitplaneDecodeContext {
     width: u32,
     /// The height of the code-block we are processing.
     height: u32,
-    /// The type of subband the current code block belongs to.
-    subband_type: SubbandType,
+    /// Whether the vertical causal flag is enabled.
+    vertically_causal: bool,
+    /// The type of sub-band the current code block belongs to.
+    sub_band_type: SubBandType,
     /// The arithmetic decoder contexts for each context label.
     contexts: [ArithmeticDecoderContext; 19],
+    /// A buffer used for concatenating the data of layers for a single codeblock.
+    /// The allocation will be taken out at the beginning of a decode operation
+    /// (leaving `None` in place) and be put back after decoding.
+    layer_buffer: Option<Vec<u8>>,
 }
 
-impl BitplaneDecodeContext {
-    pub(crate) fn new() -> Self {
+impl Default for CodeBlockDecodeContext {
+    fn default() -> Self {
         Self {
             signs: vec![],
             magnitude_array: vec![],
@@ -141,33 +185,22 @@ impl BitplaneDecodeContext {
             has_zero_coding: vec![],
             width: 0,
             height: 0,
-            subband_type: SubbandType::LowLow,
+            vertically_causal: false,
+            sub_band_type: SubBandType::LowLow,
             contexts: [ArithmeticDecoderContext::default(); 19],
+            layer_buffer: Some(vec![]),
         }
     }
+}
 
-    fn set_sign(&mut self, pos: &Position, sign: u8) {
-        self.signs[pos.index(self.width)] = sign;
-    }
-
-    fn arithmetic_decoder_context(&mut self, ctx_label: u8) -> &mut ArithmeticDecoderContext {
-        &mut self.contexts[ctx_label as usize]
-    }
-
-    /// Reset each context to the initial state defined in table D.7.
-    fn reset_contexts(&mut self) {
-        for context in &mut self.contexts {
-            context.mps = 0;
-            context.index = 0;
-        }
-
-        self.contexts[0].index = 4;
-        self.contexts[17].index = 3;
-        self.contexts[18].index = 46;
-    }
-
+impl CodeBlockDecodeContext {
     /// Completely reset context so that it can be reused for a new code-block.
-    fn reset(&mut self, code_block: &CodeBlock, subband_type: SubbandType) {
+    pub(crate) fn reset(
+        &mut self,
+        code_block: &CodeBlock,
+        sub_band_type: SubBandType,
+        code_block_style: &CodeBlockStyle,
+    ) {
         let (width, height) = (code_block.rect.width(), code_block.rect.height());
 
         for arr in [
@@ -190,8 +223,37 @@ impl BitplaneDecodeContext {
 
         self.width = width;
         self.height = height;
-        self.subband_type = subband_type;
+        self.sub_band_type = sub_band_type;
+        self.vertically_causal = code_block_style.vertically_causal_context;
         self.reset_contexts();
+    }
+
+    pub(crate) fn signs(&self) -> &[u8] {
+        &self.signs
+    }
+
+    pub(crate) fn magnitudes(&self) -> &[ComponentBits] {
+        &self.magnitude_array
+    }
+
+    fn set_sign(&mut self, pos: &Position, sign: u8) {
+        self.signs[pos.index(self.width)] = sign;
+    }
+
+    fn arithmetic_decoder_context(&mut self, ctx_label: u8) -> &mut ArithmeticDecoderContext {
+        &mut self.contexts[ctx_label as usize]
+    }
+
+    /// Reset each context to the initial state defined in table D.7.
+    fn reset_contexts(&mut self) {
+        for context in &mut self.contexts {
+            context.mps = 0;
+            context.index = 0;
+        }
+
+        self.contexts[0].index = 4;
+        self.contexts[17].index = 3;
+        self.contexts[18].index = 46;
     }
 
     fn reset_for_next_bitplane(&mut self) {
@@ -226,10 +288,11 @@ impl BitplaneDecodeContext {
         self.has_zero_coding[position.index(self.width)] != 0
     }
 
-    fn push_magnitude_bit(&mut self, position: &Position, bit: u16) {
+    fn push_magnitude_bit(&mut self, position: &Position, bit: u32) {
         self.magnitude_array[position.index(self.width)].push_bit(bit)
     }
 
+    #[inline]
     fn sign_checked(&self, x: i64, y: i64) -> u8 {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
             // OOB values should just return 0.
@@ -239,6 +302,7 @@ impl BitplaneDecodeContext {
         }
     }
 
+    #[inline]
     fn significance_state_checked(&self, x: i64, y: i64) -> u8 {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
             // OOB values should just return 0.
@@ -248,23 +312,48 @@ impl BitplaneDecodeContext {
         }
     }
 
+    #[inline]
+    fn neighbor_in_next_stripe(&self, pos: &Position, neighbor_y: u32) -> bool {
+        neighbor_y < self.height && (neighbor_y >> 2) > (pos.y >> 2)
+    }
+
+    #[inline]
     fn horizontal_significance_states(&self, pos: &Position) -> u8 {
         self.significance_state_checked(pos.x as i64 - 1, pos.y as i64)
             + self.significance_state_checked(pos.x as i64 + 1, pos.y as i64)
     }
 
+    #[inline]
     fn vertical_significance_states(&self, pos: &Position) -> u8 {
+        let suppress_lower = self.vertically_causal && self.neighbor_in_next_stripe(pos, pos.y + 1);
+
         self.significance_state_checked(pos.x as i64, pos.y as i64 - 1)
-            + self.significance_state_checked(pos.x as i64, pos.y as i64 + 1)
+            + if suppress_lower {
+                0
+            } else {
+                self.significance_state_checked(pos.x as i64, pos.y as i64 + 1)
+            }
     }
 
+    #[inline(always)]
     fn diagonal_significance_states(&self, pos: &Position) -> u8 {
+        let suppress_lower = self.vertically_causal && self.neighbor_in_next_stripe(pos, pos.y + 1);
+
         self.significance_state_checked(pos.x as i64 - 1, pos.y as i64 - 1)
             + self.significance_state_checked(pos.x as i64 + 1, pos.y as i64 - 1)
-            + self.significance_state_checked(pos.x as i64 - 1, pos.y as i64 + 1)
-            + self.significance_state_checked(pos.x as i64 + 1, pos.y as i64 + 1)
+            + if suppress_lower {
+                0
+            } else {
+                self.significance_state_checked(pos.x as i64 - 1, pos.y as i64 + 1)
+            }
+            + if suppress_lower {
+                0
+            } else {
+                self.significance_state_checked(pos.x as i64 + 1, pos.y as i64 + 1)
+            }
     }
 
+    #[inline]
     fn neighborhood_significance_states(&self, pos: &Position) -> u8 {
         self.horizontal_significance_states(pos)
             + self.vertical_significance_states(pos)
@@ -274,7 +363,7 @@ impl BitplaneDecodeContext {
 
 /// Perform the cleanup pass, specified in D.3.4.
 /// See also the flow chart in Figure 7.3 in the JPEG2000 book.
-fn cleanup_pass(ctx: &mut BitplaneDecodeContext, decoder: &mut impl BitDecoder) -> Option<()> {
+fn cleanup_pass(ctx: &mut CodeBlockDecodeContext, decoder: &mut impl BitDecoder) -> Option<()> {
     let mut position_iterator = PositionIterator::new(ctx.width, ctx.height);
 
     loop {
@@ -335,7 +424,7 @@ fn cleanup_pass(ctx: &mut BitplaneDecodeContext, decoder: &mut impl BitDecoder) 
                 decoder.read_bit(ctx.arithmetic_decoder_context(ctx_label))
             };
 
-            ctx.push_magnitude_bit(&cur_pos, bit as u16);
+            ctx.push_magnitude_bit(&cur_pos, bit);
 
             if bit == 1 {
                 decode_sign_bit(&cur_pos, ctx, decoder);
@@ -351,7 +440,7 @@ fn cleanup_pass(ctx: &mut BitplaneDecodeContext, decoder: &mut impl BitDecoder) 
 ///
 /// See also the flow chart in Figure 7.4 in the JPEG2000 book.
 fn significance_propagation_pass(
-    ctx: &mut BitplaneDecodeContext,
+    ctx: &mut CodeBlockDecodeContext,
     decoder: &mut impl BitDecoder,
 ) -> Option<()> {
     let mut position_iterator = PositionIterator::new(ctx.width, ctx.height);
@@ -367,7 +456,7 @@ fn significance_propagation_pass(
         if !ctx.is_significant(&cur_pos) && ctx.neighborhood_significance_states(&cur_pos) != 0 {
             let ctx_label = context_label_zero_coding(&cur_pos, ctx);
             let bit = decoder.read_bit(ctx.arithmetic_decoder_context(ctx_label));
-            ctx.push_magnitude_bit(&cur_pos, bit as u16);
+            ctx.push_magnitude_bit(&cur_pos, bit);
             ctx.set_zero_coded(&cur_pos);
 
             // "If the value of this bit is 1 then the significance
@@ -388,7 +477,7 @@ fn significance_propagation_pass(
 ///
 /// See also the flow chart in Figure 7.5 in the JPEG2000 book.
 fn magnitude_refinement_pass(
-    ctx: &mut BitplaneDecodeContext,
+    ctx: &mut CodeBlockDecodeContext,
     decoder: &mut impl BitDecoder,
 ) -> Option<()> {
     let mut position_iterator = PositionIterator::new(ctx.width, ctx.height);
@@ -401,7 +490,7 @@ fn magnitude_refinement_pass(
         if ctx.is_significant(&cur_pos) && !ctx.is_zero_coded(&cur_pos) {
             let ctx_label = context_label_magnitude_refinement_coding(&cur_pos, ctx);
             let bit = decoder.read_bit(ctx.arithmetic_decoder_context(ctx_label));
-            ctx.push_magnitude_bit(&cur_pos, bit as u16);
+            ctx.push_magnitude_bit(&cur_pos, bit);
             ctx.set_magnitude_refined(&cur_pos);
         }
     }
@@ -410,10 +499,17 @@ fn magnitude_refinement_pass(
 }
 
 /// Decode a sign bit (Section D.3.2).
-fn decode_sign_bit(pos: &Position, ctx: &mut BitplaneDecodeContext, decoder: &mut impl BitDecoder) {
+#[inline(always)]
+fn decode_sign_bit(
+    pos: &Position,
+    ctx: &mut CodeBlockDecodeContext,
+    decoder: &mut impl BitDecoder,
+) {
     /// Based on Table D.2.
-    fn context_label_sign_coding(pos: &Position, ctx: &BitplaneDecodeContext) -> (u8, u8) {
-        fn neighbor_contribution(ctx: &BitplaneDecodeContext, x: i64, y: i64) -> i32 {
+    #[inline(always)]
+    fn context_label_sign_coding(pos: &Position, ctx: &CodeBlockDecodeContext) -> (u8, u8) {
+        #[inline(always)]
+        fn neighbor_contribution(ctx: &CodeBlockDecodeContext, x: i64, y: i64) -> i32 {
             let sigma = ctx.significance_state_checked(x, y);
 
             let multiplied = if ctx.sign_checked(x, y) == 0 { 1 } else { -1 };
@@ -424,8 +520,13 @@ fn decode_sign_bit(pos: &Position, ctx: &mut BitplaneDecodeContext, decoder: &mu
         let h = (neighbor_contribution(ctx, pos.x as i64 - 1, pos.y as i64)
             + neighbor_contribution(ctx, pos.x as i64 + 1, pos.y as i64))
         .clamp(-1, 1);
+        let suppress_lower = ctx.vertically_causal && ctx.neighbor_in_next_stripe(pos, pos.y + 1);
         let v = (neighbor_contribution(ctx, pos.x as i64, pos.y as i64 - 1)
-            + neighbor_contribution(ctx, pos.x as i64, pos.y as i64 + 1))
+            + if suppress_lower {
+                0
+            } else {
+                neighbor_contribution(ctx, pos.x as i64, pos.y as i64 + 1)
+            })
         .clamp(-1, 1);
 
         match (h, v) {
@@ -449,14 +550,15 @@ fn decode_sign_bit(pos: &Position, ctx: &mut BitplaneDecodeContext, decoder: &mu
 }
 
 /// Return the context label for zero coding (Section D.3.1).
-fn context_label_zero_coding(pos: &Position, ctx: &BitplaneDecodeContext) -> u8 {
+#[inline(always)]
+fn context_label_zero_coding(pos: &Position, ctx: &CodeBlockDecodeContext) -> u8 {
     let mut horizontal = ctx.horizontal_significance_states(pos);
     let mut vertical = ctx.vertical_significance_states(pos);
     let diagonal = ctx.diagonal_significance_states(pos);
 
-    match ctx.subband_type {
-        SubbandType::LowLow | SubbandType::LowHigh | SubbandType::HighLow => {
-            if ctx.subband_type == SubbandType::HighLow {
+    match ctx.sub_band_type {
+        SubBandType::LowLow | SubBandType::LowHigh | SubBandType::HighLow => {
+            if ctx.sub_band_type == SubBandType::HighLow {
                 std::mem::swap(&mut horizontal, &mut vertical);
             }
 
@@ -480,7 +582,7 @@ fn context_label_zero_coding(pos: &Position, ctx: &BitplaneDecodeContext) -> u8 
                 0
             }
         }
-        SubbandType::HighHigh => {
+        SubBandType::HighHigh => {
             let hv = horizontal + vertical;
 
             if diagonal >= 3 {
@@ -507,7 +609,7 @@ fn context_label_zero_coding(pos: &Position, ctx: &BitplaneDecodeContext) -> u8 
 }
 
 /// Return the context label for magnitude refinement coding (Table D.4).
-fn context_label_magnitude_refinement_coding(pos: &Position, ctx: &BitplaneDecodeContext) -> u8 {
+fn context_label_magnitude_refinement_coding(pos: &Position, ctx: &CodeBlockDecodeContext) -> u8 {
     if ctx.is_magnitude_refined(pos) {
         16
     } else {
@@ -520,21 +622,21 @@ fn context_label_magnitude_refinement_coding(pos: &Position, ctx: &BitplaneDecod
 }
 
 #[derive(Default, Copy, Clone, Debug)]
-struct ComponentBits {
-    inner: u16,
+pub(crate) struct ComponentBits {
+    inner: u32,
     count: u8,
 }
 
 impl ComponentBits {
-    fn push_bit(&mut self, bit: u16) {
-        assert!(self.count < 16);
+    fn push_bit(&mut self, bit: u32) {
+        assert!(self.count < 32);
         assert!(bit < 2);
 
         self.inner = (self.inner << 1) | bit;
         self.count += 1;
     }
 
-    fn get(&self) -> u16 {
+    pub(crate) fn get(&self) -> u32 {
         self.inner
     }
 }
@@ -570,15 +672,6 @@ impl PositionIterator {
             width,
             height,
         }
-    }
-
-    fn reset(&mut self) {
-        self.cur_row = 0;
-        self.position = Position::default();
-    }
-
-    fn has_4_columns(&self) -> bool {
-        self.height - self.cur_row >= 4
     }
 }
 
@@ -631,18 +724,26 @@ impl BitDecoder for ArithmeticDecoder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitDecoder, BitplaneDecodeContext, PositionIterator, decode, decode_inner};
-    use crate::arithmetic_decoder::{ArithmeticDecoder, ArithmeticDecoderContext};
+    use super::{CodeBlockDecodeContext, PositionIterator, decode};
     use crate::codestream::CodeBlockStyle;
-    use crate::packet::{CodeBlock, SubbandType};
-    use crate::tile::IntRect;
-    use hayro_common::bit::{BitReader, BitWriter};
+    use crate::decode::{CodeBlock, Layer, Segment, SubBandType};
+    use crate::rect::IntRect;
 
-    struct DummyBitDecoder<'a>(BitReader<'a>);
+    impl CodeBlockDecodeContext {
+        fn coefficients(&self) -> Vec<i32> {
+            let mut coefficients = vec![];
 
-    impl BitDecoder for DummyBitDecoder<'_> {
-        fn read_bit(&mut self, context: &mut ArithmeticDecoderContext) -> u32 {
-            self.0.read(1).unwrap()
+            for (c, sign) in self.magnitudes().iter().zip(self.signs.iter()) {
+                let mut res = c.get() as i32;
+
+                if *sign != 0 {
+                    res = -res;
+                }
+
+                coefficients.push(res);
+            }
+
+            coefficients
         }
     }
 
@@ -657,10 +758,10 @@ mod tests {
         let width = 5;
         let height = 10;
 
-        let mut iter = PositionIterator::new(width, height);
+        let iter = PositionIterator::new(width, height);
         let mut produced = Vec::new();
 
-        while let Some(position) = iter.next() {
+        for position in iter {
             produced.push((position.x, position.y));
         }
 
@@ -684,125 +785,82 @@ mod tests {
         assert_eq!(produced.as_slice(), &expected);
     }
 
-    /// Example 7.3.2 in the JPEG2000 book.
-    #[test]
-    fn bitplane_decoding_1() {
-        let data = {
-            let mut buf = vec![0; 8];
-            let mut writer = BitWriter::new(&mut buf, 1).unwrap();
-
-            // CUP bitplane 2.
-            writer.write_bits([
-                1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-            ]);
-
-            // SPP bitplane 1.
-            writer.write_bits([1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0]);
-
-            // MRP bitplane 1.
-            writer.write_bits([0, 1, 1, 0]);
-
-            // No CUP for bitplane 1.
-
-            // SPP for bitplane 0.
-            writer.write_bits([0, 0, 1, 0, 0, 0, 1, 0]);
-
-            // MRP for bitplane 0.
-            writer.write_bits([1, 1, 0, 1, 0, 0, 0, 1, 1, 0]);
-
-            // No CUP for bitplane 0.
-
-            buf
-        };
-
-        let bit_reader = BitReader::new(&data);
-        let mut decoder = DummyBitDecoder(bit_reader);
-
-        let mut code_block = CodeBlock {
-            rect: IntRect::from_xywh(0, 0, 4, 4),
-            x_idx: 0,
-            y_idx: 0,
-            layer_data: vec![&data],
-            has_been_included: false,
-            missing_bit_planes: 0,
-            number_of_coding_passes: 7,
-            l_block: 0,
-            coefficients: vec![],
-        };
-
-        let mut ctx = BitplaneDecodeContext::new();
-        ctx.reset(&code_block, SubbandType::LowLow);
-
-        decode_inner(&mut code_block, 3, &mut decoder, &mut ctx);
-
-        assert_eq!(
-            code_block.coefficients,
-            vec![3, 0, 0, 5, -3, 7, 2, 1, -4, -1, -2, 3, 0, 6, 0, 2]
-        );
-    }
-
     // First packet from example in Section J.10.4.
     #[test]
     fn bitplane_decoding_2() {
-        let data = vec![0x01, 0x8f, 0x0d, 0xc8, 0x75, 0x5d];
+        let data = [0x01, 0x8f, 0x0d, 0xc8, 0x75, 0x5d];
 
-        let bit_reader = BitReader::new(&data);
-
-        let mut code_block = CodeBlock {
+        let code_block = CodeBlock {
             rect: IntRect::from_xywh(0, 0, 1, 5),
             x_idx: 0,
             y_idx: 0,
-            layer_data: vec![&data],
+            layers: 0..1,
             has_been_included: false,
             missing_bit_planes: 0,
             number_of_coding_passes: 16,
             l_block: 0,
-            coefficients: vec![],
         };
 
+        let mut ctx = CodeBlockDecodeContext::default();
+
         decode(
-            &mut code_block,
-            SubbandType::LowLow,
+            &code_block,
+            SubBandType::LowLow,
             6,
             &CodeBlockStyle::default(),
-            &mut BitplaneDecodeContext::new(),
-            &mut vec![],
+            &mut ctx,
+            &[Layer {
+                segments: Some(0..1),
+            }],
+            &[Segment {
+                length: data.len() as u32,
+                data: &data,
+            }],
         )
         .unwrap();
 
-        assert_eq!(code_block.coefficients, vec![-26, -22, -30, -32, -19]);
+        let coefficients = ctx.coefficients();
+
+        assert_eq!(coefficients, vec![-26, -22, -30, -32, -19]);
     }
 
     // Second packet from example in Section J.10.4.
     #[test]
     fn bitplane_decoding_3() {
-        let data = vec![0x0F, 0xB1, 0x76];
+        let data = [0x0F, 0xB1, 0x76];
 
-        let bit_reader = BitReader::new(&data);
-
-        let mut code_block = CodeBlock {
+        let code_block = CodeBlock {
             rect: IntRect::from_xywh(0, 0, 1, 4),
             x_idx: 0,
             y_idx: 0,
-            layer_data: vec![&data],
+            layers: 0..1,
             has_been_included: false,
             missing_bit_planes: 0,
             number_of_coding_passes: 7,
             l_block: 0,
-            coefficients: vec![],
         };
 
+        let mut ctx = CodeBlockDecodeContext::default();
+
         decode(
-            &mut code_block,
-            SubbandType::LowHigh,
+            &code_block,
+            SubBandType::LowHigh,
             3,
             &CodeBlockStyle::default(),
-            &mut BitplaneDecodeContext::new(),
-            &mut vec![],
+            &mut ctx,
+            &[Layer {
+                segments: Some(0..1),
+            }],
+            &[Segment {
+                length: data.len() as u32,
+                data: &data,
+            }],
         )
         .unwrap();
 
-        assert_eq!(code_block.coefficients, vec![1, 5, 1, 0]);
+        let coefficients = ctx.coefficients();
+
+        assert_eq!(coefficients, vec![1, 5, 1, 0]);
     }
 
     // Second packet from example in Section J.10.4.
@@ -826,29 +884,36 @@ mod tests {
             30, 233,
         ];
 
-        let bit_reader = BitReader::new(&data);
-
-        let mut code_block = CodeBlock {
+        let code_block = CodeBlock {
             rect: IntRect::from_xywh(0, 0, 32, 32),
             x_idx: 0,
             y_idx: 0,
-            layer_data: vec![&data],
+            layers: 0..1,
             has_been_included: false,
             missing_bit_planes: 5,
             number_of_coding_passes: 13,
             l_block: 0,
-            coefficients: vec![],
         };
 
+        let mut ctx = CodeBlockDecodeContext::default();
+
         decode(
-            &mut code_block,
-            SubbandType::HighLow,
+            &code_block,
+            SubBandType::HighLow,
             5,
             &CodeBlockStyle::default(),
-            &mut BitplaneDecodeContext::new(),
-            &mut vec![],
+            &mut ctx,
+            &[Layer {
+                segments: Some(0..1),
+            }],
+            &[Segment {
+                length: data.len() as u32,
+                data: &data,
+            }],
         )
         .unwrap();
+
+        let coefficients = ctx.coefficients();
 
         let expected = vec![
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -2, 0, -1, 0, 1, 1, -1, 0, 0,
@@ -891,10 +956,10 @@ mod tests {
             10, -4, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
         ];
 
-        assert_eq!(code_block.coefficients.len(), expected.len());
+        assert_eq!(coefficients.len(), expected.len());
 
         let mut expected_i = expected.iter();
-        let mut actual_i = code_block.coefficients.iter();
+        let mut actual_i = coefficients.iter();
 
         for y in 0..code_block.rect.height() {
             for x in 0..code_block.rect.width() {

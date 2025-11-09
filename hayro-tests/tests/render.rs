@@ -1201,3 +1201,16 @@ use crate::run_render_test;
 #[test] fn corpus_0054044() { run_render_test("corpus_0054044", "downloads/corpus/0054044.pdf", Some("..=0")); }
 #[test] fn corpus_0083781() { run_render_test("corpus_0083781", "downloads/corpus/0083781.pdf", None); }
 #[test] fn corpus_0267112() { run_render_test("corpus_0267112", "downloads/corpus/0267112.pdf", None); }
+#[test] fn corpus_0092523() { run_render_test("corpus_0092523", "downloads/corpus/0092523.pdf", Some("..=0")); }
+#[test] fn corpus_0731182() { run_render_test("corpus_0731182", "downloads/corpus/0731182.pdf", None); }
+#[test] fn corpus_0138201() { run_render_test("corpus_0138201", "downloads/corpus/0138201.pdf", Some("..=0")); }
+#[test] fn corpus_0370851() { run_render_test("corpus_0370851", "downloads/corpus/0370851.pdf", None); }
+#[test] fn corpus_0134905() { run_render_test("corpus_0134905", "downloads/corpus/0134905.pdf", None); }
+#[test] fn corpus_0942791() { run_render_test("corpus_0942791", "downloads/corpus/0942791.pdf", None); }
+#[test] fn corpus_0380221() { run_render_test("corpus_0380221", "downloads/corpus/0380221.pdf", None); }
+#[test] fn corpus_0554304() { run_render_test("corpus_0554304", "downloads/corpus/0554304.pdf", None); }
+#[test] fn corpus_0917011() { run_render_test("corpus_0917011", "downloads/corpus/0917011.pdf", None); }
+#[test] fn corpus_0031730() { run_render_test("corpus_0031730", "downloads/corpus/0031730.pdf", Some("..=0")); }
+#[test] fn corpus_0210666() { run_render_test("corpus_0210666", "downloads/corpus/0210666.pdf", None); }
+#[test] fn corpus_0344421() { run_render_test("corpus_0344421", "downloads/corpus/0344421.pdf", Some("7..=7")); }
+#[test] fn corpus_0357865() { run_render_test("corpus_0357865", "downloads/corpus/0357865.pdf", None); }

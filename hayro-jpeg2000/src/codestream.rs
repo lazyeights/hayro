@@ -1,6 +1,5 @@
 use crate::bitmap::ChannelData;
-use crate::packet::{SubbandType, process_tiles};
-use crate::tile::{IntRect, Tile, TileInstance, read_tiles};
+use crate::decode::{SubBandType, decode};
 use hayro_common::byte::Reader;
 
 pub(crate) fn read(stream: &[u8]) -> Result<(Header, Vec<ChannelData>), &'static str> {
@@ -12,17 +11,18 @@ pub(crate) fn read(stream: &[u8]) -> Result<(Header, Vec<ChannelData>), &'static
     }
 
     let header = read_header(&mut reader)?;
-    let tiles = read_tiles(&mut reader, &header)?;
+    let code_stream_data = reader
+        .tail()
+        .ok_or("code stream data is missing from image")?;
+    let decoded = decode(code_stream_data, &header)?;
 
-    let channels = process_tiles(&tiles, &header)?;
-
-    Ok((header, channels))
+    Ok((header, decoded))
 }
 
 #[derive(Debug)]
 pub(crate) struct Header {
     pub(crate) size_data: SizeData,
-    pub(crate) global_coding_style: GlobalCodingStyleInfo,
+    pub(crate) global_coding_style: CodingStyleDefault,
     pub(crate) component_infos: Vec<ComponentInfo>,
 }
 
@@ -84,24 +84,92 @@ fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
     let cod = cod.ok_or("missing COD marker")?;
     let qcd = qcd.ok_or("missing QCD marker")?;
 
-    let component_infos = size_data
+    let component_infos: Vec<ComponentInfo> = size_data
         .component_sizes
         .iter()
         .enumerate()
         .map(|(idx, csi)| ComponentInfo {
             size_info: *csi,
-            coding_style_parameters: cod_components[idx]
+            coding_style: cod_components[idx]
                 .clone()
                 .unwrap_or(cod.component_parameters.clone()),
             quantization_info: qcd_components[idx].clone().unwrap_or(qcd.clone()),
         })
         .collect();
 
+    for ci in &component_infos {
+        if ci
+            .coding_style
+            .parameters
+            .code_block_style
+            .selective_arithmetic_coding_bypass
+        {
+            return Err("unsupported code-block style features encountered during decoding");
+        }
+    }
+
     Ok(Header {
         size_data,
         global_coding_style: cod.clone(),
         component_infos,
     })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ComponentInfo {
+    pub(crate) size_info: ComponentSizeInfo,
+    pub(crate) coding_style: CodingStyleComponent,
+    pub(crate) quantization_info: QuantizationInfo,
+}
+
+impl ComponentInfo {
+    pub(crate) fn exponent_mantissa(
+        &self,
+        sub_band_type: SubBandType,
+        resolution: u16,
+    ) -> (u16, u16) {
+        let n_ll = self.coding_style.parameters.num_decomposition_levels;
+
+        let sb_index = match sub_band_type {
+            // TODO: Shouldn't be reached.
+            SubBandType::LowLow => u16::MAX,
+            SubBandType::HighLow => 0,
+            SubBandType::LowHigh => 1,
+            SubBandType::HighHigh => 2,
+        };
+
+        let step_sizes = &self.quantization_info.step_sizes;
+        match self.quantization_info.quantization_style {
+            QuantizationStyle::NoQuantization | QuantizationStyle::ScalarExpounded => {
+                let entry = if resolution == 0 {
+                    step_sizes[0]
+                } else {
+                    step_sizes[(1 + (resolution - 1) * 3 + sb_index) as usize]
+                };
+
+                (entry.exponent, entry.mantissa)
+            }
+            QuantizationStyle::ScalarDerived => {
+                let e_0 = step_sizes[0].exponent;
+                let mantissa = step_sizes[0].mantissa;
+                let n_b = if resolution == 0 {
+                    n_ll
+                } else {
+                    n_ll + 1 - resolution
+                };
+
+                (e_0 - n_ll + n_b, mantissa)
+            }
+        }
+    }
+
+    pub(crate) fn wavelet_transform(&self) -> WaveletTransform {
+        self.coding_style.parameters.transformation
+    }
+
+    pub(crate) fn num_resolution_levels(&self) -> u16 {
+        self.coding_style.parameters.num_resolution_levels
+    }
 }
 
 /// Progression order (Table A.16).
@@ -123,23 +191,6 @@ impl ProgressionOrder {
             3 => Ok(ProgressionOrder::PositionComponentResolutionLayer),
             4 => Ok(ProgressionOrder::ComponentPositionResolutionLayer),
             _ => Err("invalid progression order"),
-        }
-    }
-}
-
-/// Multiple component transformation type (Table A.17).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultipleComponentTransform {
-    None,
-    Used,
-}
-
-impl MultipleComponentTransform {
-    fn from_u8(value: u8) -> Result<Self, &'static str> {
-        match value {
-            0 => Ok(MultipleComponentTransform::None),
-            1 => Ok(MultipleComponentTransform::Used),
-            _ => Err("invalid MCT value"),
         }
     }
 }
@@ -192,7 +243,7 @@ pub(crate) struct CodeBlockStyle {
     pub(crate) reset_context_probabilities: bool,
     pub(crate) termination_on_each_pass: bool,
     pub(crate) vertically_causal_context: bool,
-    pub(crate) predictable_termination: bool,
+    pub(crate) _predictable_termination: bool,
     pub(crate) segmentation_symbols: bool,
 }
 
@@ -203,7 +254,7 @@ impl CodeBlockStyle {
             reset_context_probabilities: (value & 0x02) != 0,
             termination_on_each_pass: (value & 0x04) != 0,
             vertically_causal_context: (value & 0x08) != 0,
-            predictable_termination: (value & 0x10) != 0,
+            _predictable_termination: (value & 0x10) != 0,
             segmentation_symbols: (value & 0x20) != 0,
         }
     }
@@ -228,7 +279,38 @@ impl QuantizationStyle {
     }
 }
 
-/// Common coding style parameters (A.6.1 and A.6.2).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StepSize {
+    pub(crate) mantissa: u16,
+    pub(crate) exponent: u16,
+}
+
+/// Quantization properties, from the QCD and QCC markers (A.6.4 and A.6.5).
+#[derive(Clone, Debug)]
+pub(crate) struct QuantizationInfo {
+    pub(crate) quantization_style: QuantizationStyle,
+    pub(crate) guard_bits: u8,
+    pub(crate) step_sizes: Vec<StepSize>,
+}
+
+/// Default values for coding style, from the COD marker (A.6.1).
+#[derive(Debug, Clone)]
+pub(crate) struct CodingStyleDefault {
+    pub(crate) progression_order: ProgressionOrder,
+    pub(crate) num_layers: u16,
+    pub(crate) mct: bool,
+    // This is the default used for all components, if not overridden by COC.
+    pub(crate) component_parameters: CodingStyleComponent,
+}
+
+/// Values of coding style for each component, from the COC marker (A.6.2).
+#[derive(Clone, Debug)]
+pub(crate) struct CodingStyleComponent {
+    pub(crate) flags: CodingStyleFlags,
+    pub(crate) parameters: CodingStyleParameters,
+}
+
+/// Shared parameters between the COC and COD marker (A.6.1 and A.6.2).
 #[derive(Clone, Debug)]
 pub(crate) struct CodingStyleParameters {
     pub(crate) num_decomposition_levels: u16,
@@ -238,37 +320,6 @@ pub(crate) struct CodingStyleParameters {
     pub(crate) code_block_style: CodeBlockStyle,
     pub(crate) transformation: WaveletTransform,
     pub(crate) precinct_exponents: Vec<(u8, u8)>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct StepSize {
-    pub(crate) mantissa: u16,
-    pub(crate) exponent: u16,
-}
-
-/// Common quantization parameters (A.6.4 and A.6.5).
-#[derive(Clone, Debug)]
-pub(crate) struct QuantizationInfo {
-    pub(crate) quantization_style: QuantizationStyle,
-    pub(crate) guard_bits: u8,
-    pub(crate) step_sizes: Vec<StepSize>,
-}
-
-/// Default values for coding style (A.6.1).
-#[derive(Debug, Clone)]
-pub(crate) struct GlobalCodingStyleInfo {
-    pub(crate) progression_order: ProgressionOrder,
-    pub(crate) num_layers: u16,
-    pub(crate) mct: MultipleComponentTransform,
-    // This is the default used for all components, if not overridden by COC.
-    pub(crate) component_parameters: ComponentCodingStyle,
-}
-
-/// Values of coding style for each component (A.6.2).
-#[derive(Clone, Debug)]
-pub(crate) struct ComponentCodingStyle {
-    pub(crate) flags: CodingStyleFlags,
-    pub(crate) parameters: CodingStyleParameters,
 }
 
 #[derive(Debug)]
@@ -295,34 +346,6 @@ pub(crate) struct SizeData {
 }
 
 impl SizeData {
-    /// Return the raw coordinates of the tile with the given index.
-    pub(crate) fn tile_coords(&self, idx: u32) -> IntRect {
-        let x_coord = self.tile_x_coord(idx);
-        let y_coord = self.tile_y_coord(idx);
-
-        // See B-7, B-8, B-9 and B-10.
-        let x0 = u32::max(
-            self.tile_x_offset + x_coord * self.tile_width,
-            self.image_area_x_offset,
-        );
-        let y0 = u32::max(
-            self.tile_y_offset + y_coord * self.tile_height,
-            self.image_area_y_offset,
-        );
-
-        // Note that `x1` and `y1` are exclusive.
-        let x1 = u32::min(
-            self.tile_x_offset + (x_coord + 1) * self.tile_width,
-            self.reference_grid_width,
-        );
-        let y1 = u32::min(
-            self.tile_y_offset + (y_coord + 1) * self.tile_height,
-            self.reference_grid_height,
-        );
-
-        IntRect::from_ltrb(x0, y0, x1, y1)
-    }
-
     pub(crate) fn tile_x_coord(&self, idx: u32) -> u32 {
         // See B-6.
         idx % self.num_x_tiles()
@@ -338,125 +361,10 @@ impl SizeData {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ComponentSizeInfo {
     pub(crate) precision: u8,
-    pub(crate) is_signed: bool,
+    // TODO: What is this field for?
+    pub(crate) _is_signed: bool,
     pub(crate) horizontal_resolution: u8,
     pub(crate) vertical_resolution: u8,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ComponentInfo {
-    pub(crate) size_info: ComponentSizeInfo,
-    pub(crate) coding_style_parameters: ComponentCodingStyle,
-    pub(crate) quantization_info: QuantizationInfo,
-}
-
-impl ComponentInfo {
-    /// Return the coordinates of the rectangle scaled by the horizontal and vertical
-    /// resolution of the component.
-    pub(crate) fn tile_component_rect(&self, tile_rect: IntRect) -> IntRect {
-        if self.size_info.horizontal_resolution == 1 && self.size_info.vertical_resolution == 1 {
-            tile_rect
-        } else {
-            // As described in B-12.
-            let t_x0 = tile_rect
-                .x0
-                .div_ceil(self.size_info.horizontal_resolution as u32);
-            let t_y0 = tile_rect
-                .y0
-                .div_ceil(self.size_info.vertical_resolution as u32);
-            let t_x1 = tile_rect
-                .x1
-                .div_ceil(self.size_info.horizontal_resolution as u32);
-            let t_y1 = tile_rect
-                .y1
-                .div_ceil(self.size_info.vertical_resolution as u32);
-
-            IntRect::from_ltrb(t_x0, t_y0, t_x1, t_y1)
-        }
-    }
-
-    pub(crate) fn exponent_mantissa(
-        &self,
-        subband_type: SubbandType,
-        resolution: u16,
-    ) -> (u16, u16) {
-        let n_ll = self
-            .coding_style_parameters
-            .parameters
-            .num_decomposition_levels;
-
-        let sb_index = match subband_type {
-            // TODO: Shouldn't be reached.
-            SubbandType::LowLow => u16::MAX,
-            SubbandType::HighLow => 0,
-            SubbandType::LowHigh => 1,
-            SubbandType::HighHigh => 2,
-        };
-
-        let step_sizes = &self.quantization_info.step_sizes;
-        match self.quantization_info.quantization_style {
-            QuantizationStyle::NoQuantization | QuantizationStyle::ScalarExpounded => {
-                let entry = if resolution == 0 {
-                    step_sizes[0]
-                } else {
-                    step_sizes[(1 + (resolution - 1) * 3 + sb_index) as usize]
-                };
-
-                (entry.exponent, entry.mantissa)
-            }
-            QuantizationStyle::ScalarDerived => {
-                let e_0 = step_sizes[0].exponent;
-                let mantissa = step_sizes[0].mantissa;
-                let n_b = if resolution == 0 {
-                    n_ll
-                } else {
-                    n_ll + 1 - resolution
-                };
-
-                (e_0 - n_ll + n_b, mantissa)
-            }
-        }
-    }
-
-    pub(crate) fn tile_instance<'a>(
-        &'a self,
-        tile: &Tile<'_>,
-        resolution: u16,
-    ) -> TileInstance<'a> {
-        // See formula B-14.
-        let r = resolution;
-        let n_l = self
-            .coding_style_parameters
-            .parameters
-            .num_decomposition_levels;
-        let tile_component_rect = self.tile_component_rect(tile.rect);
-
-        let tx0 = tile_component_rect
-            .x0
-            .div_ceil(2u32.pow(n_l as u32 - r as u32));
-        let ty0 = tile_component_rect
-            .y0
-            .div_ceil(2u32.pow(n_l as u32 - r as u32));
-        let tx1 = tile_component_rect
-            .x1
-            .div_ceil(2u32.pow(n_l as u32 - r as u32));
-        let ty1 = tile_component_rect
-            .y1
-            .div_ceil(2u32.pow(n_l as u32 - r as u32));
-
-        let resolution_transformed_rect = IntRect::from_ltrb(tx0, ty0, tx1, ty1);
-
-        TileInstance {
-            resolution,
-            component_info: self,
-            tile_component_rect,
-            resolution_transformed_rect,
-        }
-    }
-
-    pub(crate) fn wavelet_transform(&self) -> WaveletTransform {
-        self.coding_style_parameters.parameters.transformation
-    }
 }
 
 impl SizeData {
@@ -533,10 +441,6 @@ fn size_marker(reader: &mut Reader) -> Result<SizeData, &'static str> {
                 "unsupported component precision: only components up to 8 bits are handled",
             );
         }
-
-        if comp.vertical_resolution != 1 || comp.horizontal_resolution != 1 {
-            return Err("unsupported component resolution: only unit resolutions are handled");
-        }
     }
 
     Ok(size_data)
@@ -567,9 +471,15 @@ fn size_marker_inner(reader: &mut Reader) -> Option<SizeData> {
         let precision = (ssiz & 0x7F) + 1;
         let is_signed = (ssiz & 0x80) != 0;
 
+        if (x_rsiz != 1 || y_rsiz != 1) && (x_osiz != 0 || y_osiz != 0) {
+            // Those are probably very rare. Let's wait until we have a test case
+            // before attempting to implement it.
+            return None;
+        }
+
         components.push(ComponentSizeInfo {
             precision,
-            is_signed,
+            _is_signed: is_signed,
             horizontal_resolution: x_rsiz,
             vertical_resolution: y_rsiz,
         });
@@ -650,7 +560,7 @@ pub(crate) fn skip_marker_segment(reader: &mut Reader) -> Option<()> {
 }
 
 /// COD marker (A.6.1).
-pub(crate) fn cod_marker(reader: &mut Reader) -> Option<GlobalCodingStyleInfo> {
+pub(crate) fn cod_marker(reader: &mut Reader) -> Option<CodingStyleDefault> {
     // Length.
     let _ = reader.read_u16()?;
 
@@ -658,15 +568,15 @@ pub(crate) fn cod_marker(reader: &mut Reader) -> Option<GlobalCodingStyleInfo> {
     let progression_order = ProgressionOrder::from_u8(reader.read_byte()?).ok()?;
 
     let num_layers = reader.read_u16()?;
-    let mct = MultipleComponentTransform::from_u8(reader.read_byte()?).ok()?;
+    let mct = reader.read_byte()? == 1;
 
     let coding_style_parameters = coding_style_parameters(reader, &coding_style_flags)?;
 
-    Some(GlobalCodingStyleInfo {
+    Some(CodingStyleDefault {
         progression_order,
         num_layers,
         mct,
-        component_parameters: ComponentCodingStyle {
+        component_parameters: CodingStyleComponent {
             flags: coding_style_flags,
             parameters: coding_style_parameters,
         },
@@ -674,7 +584,7 @@ pub(crate) fn cod_marker(reader: &mut Reader) -> Option<GlobalCodingStyleInfo> {
 }
 
 /// COC marker (A.6.2).
-pub(crate) fn coc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, ComponentCodingStyle)> {
+pub(crate) fn coc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, CodingStyleComponent)> {
     // Length.
     let _ = reader.read_u16()?;
 
@@ -688,7 +598,7 @@ pub(crate) fn coc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, Compone
     // Read SPcoc - coding style parameters (same structure as SPcod from COD)
     let parameters = coding_style_parameters(reader, &coding_style)?;
 
-    let coc = ComponentCodingStyle {
+    let coc = CodingStyleComponent {
         flags: coding_style,
         parameters,
     };
@@ -783,7 +693,8 @@ fn quantization_parameters(
     })
 }
 
-fn skip_code(marker_code: u8) -> bool {
+// TODO: Use this
+fn _skip_code(marker_code: u8) -> bool {
     // All markers with the marker code between 0xFF30 and 0xFF3F have no marker
     // segment parameters. They shall be skipped by the decoder.
     (0x30..=0x3F).contains(&marker_code)
@@ -807,6 +718,7 @@ impl ReaderExt for Reader<'_> {
     }
 }
 
+#[allow(unused)]
 /// Marker codes (Table A.2).
 pub(crate) mod markers {
     /// Start of codestream - 'SOC'.

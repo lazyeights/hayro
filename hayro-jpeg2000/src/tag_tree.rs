@@ -6,9 +6,12 @@
 //! have a value of 3 or higher. The root node therefore stores the smallest
 //! values across all children.
 
-use crate::packet::BitReaderExt;
+use crate::decode::BitReaderExt;
 use hayro_common::bit::BitReader;
 use log::warn;
+
+// TODO: Can we change the architecture so that we don't need to reallocate
+// for each new tag tree but instead reuse existing allocations?
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub(crate) struct TagNode {
@@ -49,27 +52,18 @@ impl TagNode {
             level,
             value: 0,
             initialized: false,
-            children: vec![],
+            children: Vec::with_capacity(4),
         }
     }
 
-    fn x_split(&self) -> u32 {
+    /// The width of the top-left child.
+    fn top_left_width(&self) -> u32 {
         u32::min(1 << (self.level - 1), self.width)
     }
 
-    fn y_split(&self) -> u32 {
+    /// The height of the top-left child.
+    fn top_left_height(&self) -> u32 {
         u32::min(1 << (self.level - 1), self.height)
-    }
-
-    fn is_dummy(&self) -> bool {
-        self.width == 0 || self.height == 0
-    }
-
-    fn real_children(&self) -> usize {
-        self.children
-            .iter()
-            .map(|c| if !c.is_dummy() { 1 } else { 0 })
-            .sum()
     }
 }
 
@@ -86,8 +80,8 @@ impl TagNode {
 
         // Determine the width and height of the top-left child node. Based
         // on this, we can infer the dimensions of all other child nodes.
-        let top_left_width = tag.x_split();
-        let top_left_height = tag.y_split();
+        let top_left_width = tag.top_left_width();
+        let top_left_height = tag.top_left_height();
 
         let mut push = |node: TagNode| {
             tag.children.push(node);
@@ -158,8 +152,8 @@ impl TagNode {
             return Some(self.value);
         }
 
-        let top_left_width = self.x_split();
-        let top_left_height = self.y_split();
+        let top_left_width = self.top_left_width();
+        let top_left_height = self.top_left_height();
 
         let left = x < top_left_width;
         let top = y < top_left_height;
@@ -230,6 +224,19 @@ impl TagTree {
 mod tests {
     use super::*;
     use hayro_common::bit::BitWriter;
+
+    impl TagNode {
+        fn is_dummy(&self) -> bool {
+            self.width == 0 || self.height == 0
+        }
+
+        fn real_children(&self) -> usize {
+            self.children
+                .iter()
+                .map(|c| if !c.is_dummy() { 1 } else { 0 })
+                .sum()
+        }
+    }
 
     /// The example from B.10.2, in its extended form as shown in the
     /// "JPEG2000 Standard for Image compression" book.

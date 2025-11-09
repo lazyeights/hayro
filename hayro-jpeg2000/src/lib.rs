@@ -1,21 +1,20 @@
-// TODO: Remove
-#![allow(warnings)]
-
 use crate::bitmap::Bitmap;
 use crate::boxes::{
     CHANNEL_DEFINITION, COLOUR_SPECIFICATION, CONTIGUOUS_CODESTREAM, FILE_TYPE, IMAGE_HEADER,
-    JP2_HEADER, JP2_SIGNATURE, read_box,
+    JP2_HEADER, JP2_SIGNATURE, read_box, tag_to_string,
 };
 use hayro_common::byte::Reader;
+use log::{debug, warn};
 
 mod arithmetic_decoder;
 pub mod bitmap;
 pub(crate) mod bitplane;
 pub mod boxes;
 mod codestream;
+mod decode;
 pub(crate) mod idwt;
-mod packet;
 mod progression;
+pub(crate) mod rect;
 mod tag_tree;
 mod tile;
 
@@ -28,14 +27,52 @@ pub struct ImageMetadata {
     pub width: u32,
     /// Intellectual property flag (0 = no IPR box, 1 = contains IPR box).
     pub has_intellectual_property: u8,
-    /// Colour specification method (1 = enumerated, 2 = ICC profile).
-    pub colour_method: Option<u8>,
-    /// Enumerated colourspace (if colour_method = 1).
-    pub enumerated_colourspace: Option<u32>,
-    /// ICC profile data (if colour_method = 2).
-    pub icc_profile: Option<Vec<u8>>,
+    /// Colour specification information from the Colour Specification box.
+    pub colour_specification: Option<ColourSpecification>,
     /// Channel definitions specified by the Channel Definition box (cdef).
     pub channel_definitions: Vec<ChannelDefinition>,
+}
+
+/// Parsed contents of a Colour Specification box as defined in ISO/IEC 15444-1.
+#[derive(Debug, Clone)]
+pub struct ColourSpecification {
+    /// METH, the specification method for this box.
+    pub method: ColourSpecificationMethod,
+    /// PREC, precedence hint.
+    pub precedence: u8,
+    /// APPROX, colourspace approximation indicator.
+    pub approximation: u8,
+}
+
+/// The way the colourspace is described inside the Colour Specification box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColourSpecificationMethod {
+    /// Enumerated colourspace (EnumCS field present).
+    Enumerated(EnumeratedColourspace),
+    /// ICC profile (PROFILE field present).
+    IccProfile(Vec<u8>),
+    /// Reserved or unsupported method; stores raw value for debugging.
+    Unknown(u8),
+}
+
+/// Enumerated colourspace identifiers defined by ISO/IEC 15444-1 Table L.10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumeratedColourspace {
+    Srgb,
+    Greyscale,
+    Sycc,
+    Reserved(u32),
+}
+
+impl EnumeratedColourspace {
+    fn from_raw(value: u32) -> Self {
+        match value {
+            16 => EnumeratedColourspace::Srgb,
+            17 => EnumeratedColourspace::Greyscale,
+            18 => EnumeratedColourspace::Sycc,
+            v => EnumeratedColourspace::Reserved(v),
+        }
+    }
 }
 
 /// Association between codestream components/channels and their semantic role.
@@ -158,32 +195,43 @@ impl ImageMetadata {
         let mut reader = Reader::new(data);
 
         let meth = reader.read_byte()?;
-        let _prec = reader.read_byte()?; // Reserved, ignored
-        let _approx = reader.read_byte()?; // Reserved, ignored
+        let prec = reader.read_byte()?;
+        let approx = reader.read_byte()?;
 
-        self.colour_method = Some(meth);
-
-        match meth {
+        let method = match meth {
             1 => {
-                // Enumerated colourspace
-                self.enumerated_colourspace = Some(reader.read_u32()?);
+                let enumerated = reader.read_u32()?;
+                ColourSpecificationMethod::Enumerated(EnumeratedColourspace::from_raw(enumerated))
             }
             2 => {
-                // ICC profile
                 let profile_data = reader.tail()?.to_vec();
-                self.icc_profile = Some(profile_data);
+                ColourSpecificationMethod::IccProfile(profile_data)
             }
-            _ => {
-                // Unknown method, ignore
-            }
-        }
+            v => ColourSpecificationMethod::Unknown(v),
+        };
+
+        self.colour_specification = Some(ColourSpecification {
+            method,
+            precedence: prec,
+            approximation: approx,
+        });
 
         Some(())
     }
 }
 
 pub fn read(data: &[u8]) -> Result<Bitmap, &'static str> {
-    read_jp2_file(data).or_else(|_| read_jp2_codestream(data))
+    // JP2 signature box: 00 00 00 0C 6A 50 20 20
+    const JP2_MAGIC: &[u8] = b"\x00\x00\x00\x0C\x6A\x50\x20\x20";
+    // Codestream signature: FF 4F FF 51 (SOC + SIZ markers)
+    const CODESTREAM_MAGIC: &[u8] = b"\xFF\x4F\xFF\x51";
+    if data.starts_with(JP2_MAGIC) {
+        read_jp2_file(data)
+    } else if data.starts_with(CODESTREAM_MAGIC) {
+        read_jp2_codestream(data)
+    } else {
+        Err("invalid JP2 file")
+    }
 }
 
 fn read_jp2_codestream(data: &[u8]) -> Result<Bitmap, &'static str> {
@@ -193,9 +241,7 @@ fn read_jp2_codestream(data: &[u8]) -> Result<Bitmap, &'static str> {
         height: header.size_data.image_height(),
         width: header.size_data.image_width(),
         has_intellectual_property: 0,
-        colour_method: None,
-        enumerated_colourspace: None,
-        icc_profile: None,
+        colour_specification: None,
         channel_definitions: vec![],
     };
 
@@ -221,7 +267,11 @@ fn read_jp2_file(data: &[u8]) -> Result<Bitmap, &'static str> {
 
     // Read boxes until we find the JP2 Header box
     while !reader.at_end() {
-        let current_box = read_box(&mut reader).ok_or("failed to read JP2 box")?;
+        let Some(current_box) = read_box(&mut reader) else {
+            warn!("failed to read a JP2 box, aborting");
+
+            break;
+        };
 
         if current_box.box_type == JP2_HEADER {
             // Parse the JP2 Header box (superbox)
@@ -229,9 +279,7 @@ fn read_jp2_file(data: &[u8]) -> Result<Bitmap, &'static str> {
                 height: 0,
                 width: 0,
                 has_intellectual_property: 0,
-                colour_method: None,
-                enumerated_colourspace: None,
-                icc_profile: None,
+                colour_specification: None,
                 channel_definitions: Vec::new(),
             };
 
@@ -256,7 +304,7 @@ fn read_jp2_file(data: &[u8]) -> Result<Bitmap, &'static str> {
                             .ok_or("failed to parse colour")?;
                     }
                     _ => {
-                        // eprintln!("ignoring box {}", tag_to_string(child_box.box_type));
+                        debug!("ignoring box {}", tag_to_string(child_box.box_type));
                     }
                 }
             }
@@ -265,7 +313,7 @@ fn read_jp2_file(data: &[u8]) -> Result<Bitmap, &'static str> {
         } else if current_box.box_type == CONTIGUOUS_CODESTREAM {
             channels = Ok(codestream::read(current_box.data)?);
         } else {
-            // eprintln!("ignoring outer box {}", tag_to_string(current_box.box_type));
+            debug!("ignoring outer box {}", tag_to_string(current_box.box_type));
         }
     }
 

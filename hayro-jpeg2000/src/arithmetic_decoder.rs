@@ -168,6 +168,11 @@ impl<'a> ArithmeticDecoder<'a> {
         self.data
             .get(self.base_pointer as usize)
             .copied()
+            // "The number of bytes corresponding to the coding passes is
+            // specified in the packet header. Often at that point there are
+            // more symbols to be decoded. Therefore, the decoder shall extend
+            // the input bit stream to the arithmetic coder with 0xFF bytes,
+            // as necessary, until all symbols have been decoded."
             .unwrap_or(0xFF)
     }
 
@@ -183,12 +188,6 @@ impl<'a> ArithmeticDecoder<'a> {
 pub(crate) struct ArithmeticDecoderContext {
     pub(crate) index: u32,
     pub(crate) mps: u32,
-}
-
-impl ArithmeticDecoderContext {
-    pub(crate) fn new(index: u32, mps: u32) -> Self {
-        Self { index, mps }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

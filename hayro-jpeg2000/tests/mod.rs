@@ -121,6 +121,46 @@ fn openjpeg_lossy_quantization_scalar_derived() {
     run_asset_test("openjpeg-lossy-quantization-scalar-derived.jp2");
 }
 
+#[test]
+fn jasper_rgba_u8_cbstyle_02_resetprob() {
+    run_asset_test("jasper-rgba-u8-cbstyle-02-resetprob.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_04_termall() {
+    run_asset_test("jasper-rgba-u8-cbstyle-04-termall.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_04_termall_layers() {
+    run_asset_test("jasper-rgba-u8-cbstyle-04-termall-layers.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_06_resetprob_termall() {
+    run_asset_test("jasper-rgba-u8-cbstyle-06-resetprob-termall.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_36_termall_segsym() {
+    run_asset_test("jasper-rgba-u8-cbstyle-36-termall-segsym.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_08_vcausal() {
+    run_asset_test("jasper-rgba-u8-cbstyle-08-vcausal.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_16_pterm() {
+    run_asset_test("jasper-rgba-u8-cbstyle-16-pterm.jp2");
+}
+
+#[test]
+fn jasper_rgba_u8_cbstyle_32_segsym() {
+    run_asset_test("jasper-rgba-u8-cbstyle-32-segsym.jp2");
+}
+
 fn run_asset_test(file_name: &str) {
     let asset_path = ASSETS_PATH.join(file_name);
     let data = fs::read(&asset_path).expect("failed to read asset");
@@ -187,8 +227,8 @@ fn bitmap_to_dynamic_image(bitmap: Bitmap) -> DynamicImage {
         let num_samples = channels.iter().map(|c| c.len()).min().unwrap();
 
         for sample_idx in 0..num_samples {
-            for channel_idx in 0..num_channels {
-                interleaved.push(channels[channel_idx][sample_idx]);
+            for channel in &channels {
+                interleaved.push(channel[sample_idx]);
             }
         }
 

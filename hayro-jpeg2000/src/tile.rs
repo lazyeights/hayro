@@ -1,158 +1,435 @@
-use crate::codestream::{ComponentInfo, Header, ReaderExt, SizeData, markers, skip_marker_segment};
-use crate::packet::SubbandType;
+//! Creating tiles and parsing their constituent tile parts.
+
+use crate::codestream::{
+    ComponentInfo, Header, ProgressionOrder, ReaderExt, markers, skip_marker_segment,
+};
+use crate::decode::SubBandType;
+use crate::rect::IntRect;
 use hayro_common::byte::Reader;
+use log::warn;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct IntRect {
-    pub(crate) x0: u32,
-    pub(crate) y0: u32,
-    pub(crate) x1: u32,
-    pub(crate) y1: u32,
-}
-
-impl IntRect {
-    pub(crate) fn from_ltrb(x0: u32, y0: u32, x1: u32, y1: u32) -> Self {
-        Self { x0, y0, x1, y1 }
-    }
-
-    pub(crate) fn from_xywh(x: u32, y: u32, w: u32, h: u32) -> Self {
-        Self {
-            x0: x,
-            y0: y,
-            x1: x + w,
-            y1: y + h,
-        }
-    }
-
-    pub(crate) fn width(&self) -> u32 {
-        // See B-11.
-        self.x1 - self.x0
-    }
-
-    pub(crate) fn height(&self) -> u32 {
-        // See B-11.
-        self.y1 - self.y0
-    }
-
-    pub(crate) fn intersect(&self, other: IntRect) -> IntRect {
-        if self.x1 < other.x0 || other.x1 < self.x0 || self.y1 < other.y0 || other.y1 < self.y0 {
-            IntRect::from_xywh(0, 0, 0, 0)
-        } else {
-            IntRect::from_ltrb(
-                u32::max(self.x0, other.x0),
-                u32::max(self.y0, other.y0),
-                u32::min(self.x1, other.x1),
-                u32::min(self.y1, other.y1),
-            )
-        }
-    }
-}
-
+/// A single tile in the image.
 #[derive(Clone, Debug)]
 pub(crate) struct Tile<'a> {
-    tile_part_infos: Vec<TilePartInfo<'a>>,
-    pub(crate) component_info: Vec<ComponentInfo>,
+    pub(crate) idx: u32,
+    /// The concatenated tile parts that contain all the information for all
+    /// constituent codeblocks.
+    pub(crate) tile_parts: Vec<&'a [u8]>,
+    /// Parameters for each component. In most cases, those are directly
+    /// inherited from the main header. But in some cases, individual tiles
+    /// might override them.
+    // TODO: Don't store size_info
+    pub(crate) component_infos: Vec<ComponentInfo>,
+    /// The rectangle making up the area of the tile. `x1` and `y1` are
+    /// exclusive.
     pub(crate) rect: IntRect,
+    pub(crate) progression_order: ProgressionOrder,
+    pub(crate) num_layers: u16,
+    pub(crate) mct: bool,
 }
 
 impl<'a> Tile<'a> {
-    fn new(idx: u32, size_data: &SizeData) -> Tile<'a> {
-        let raw_coords = size_data.tile_coords(idx);
+    fn new(idx: u32, header: &Header) -> Tile<'a> {
+        let rect = {
+            let size_data = &header.size_data;
+
+            let x_coord = size_data.tile_x_coord(idx);
+            let y_coord = size_data.tile_y_coord(idx);
+
+            // See B-7, B-8, B-9 and B-10.
+            let x0 = u32::max(
+                size_data.tile_x_offset + x_coord * size_data.tile_width,
+                size_data.image_area_x_offset,
+            );
+            let y0 = u32::max(
+                size_data.tile_y_offset + y_coord * size_data.tile_height,
+                size_data.image_area_y_offset,
+            );
+
+            // Note that `x1` and `y1` are exclusive.
+            let x1 = u32::min(
+                size_data.tile_x_offset + (x_coord + 1) * size_data.tile_width,
+                size_data.reference_grid_width,
+            );
+            let y1 = u32::min(
+                size_data.tile_y_offset + (y_coord + 1) * size_data.tile_height,
+                size_data.reference_grid_height,
+            );
+
+            IntRect::from_ltrb(x0, y0, x1, y1)
+        };
 
         Tile {
-            tile_part_infos: vec![],
-            component_info: vec![],
-            rect: raw_coords,
+            idx,
+            // Will be filled once we start parsing.
+            tile_parts: vec![],
+            rect,
+            // By default, each tile inherits the settings from the main
+            // header. When parsing the tile parts, some of these settings
+            // might be overridden.
+            component_infos: header.component_infos.clone(),
+            progression_order: header.global_coding_style.progression_order,
+            mct: header.global_coding_style.mct,
+            num_layers: header.global_coding_style.num_layers,
         }
     }
 
-    pub(crate) fn tile_parts(&self) -> impl Iterator<Item = TilePart<'_>> {
-        self.tile_part_infos.iter().map(|t| TilePart {
-            data: t.data,
-            tile: self,
-        })
+    /// Return an iterator over the component tiles.
+    pub(crate) fn component_tiles(&self) -> impl Iterator<Item = ComponentTile<'_>> {
+        self.component_infos
+            .iter()
+            .map(|i| ComponentTile::new(self, i))
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct TilePartInfo<'a> {
-    pub(crate) data: &'a [u8],
+/// Create the tiles and parse their constituent tile parts.
+pub(crate) fn parse<'a>(
+    reader: &mut Reader<'a>,
+    main_header: &'a Header,
+) -> Result<Vec<Tile<'a>>, &'static str> {
+    let mut tiles = (0..main_header.size_data.num_tiles() as usize)
+        .map(|idx| Tile::new(idx as u32, main_header))
+        .collect::<Vec<_>>();
+
+    parse_tile_part(reader, main_header, &mut tiles, true)?;
+
+    while reader.peek_marker() == Some(markers::SOT) {
+        parse_tile_part(reader, main_header, &mut tiles, false)?;
+    }
+
+    // TODO: Add this for strict mode.
+    // if reader.read_marker()? != markers::EOC {
+    //     return Err("expected EOC marker when parsing tiles");
+    // }
+
+    Ok(tiles)
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct TilePart<'a> {
-    pub(crate) data: &'a [u8],
+fn parse_tile_part<'a>(
+    reader: &mut Reader<'a>,
+    main_header: &Header,
+    tiles: &mut [Tile<'a>],
+    first: bool,
+) -> Result<(), &'static str> {
+    if reader.read_marker()? != markers::SOT {
+        return Err("expected SOT marker at tile-part start");
+    }
+
+    let tile_part_header = sot_marker(reader).ok_or("failed to read SOT marker")?;
+
+    if tile_part_header.tile_index as u32 >= main_header.size_data.num_tiles() {
+        return Err("invalid tile index in tile-part header");
+    }
+
+    let data_len = if tile_part_header.tile_part_length == 0 {
+        reader.tail().map(|d| d.len()).unwrap_or(0)
+    } else {
+        // Subtract 12 to account for the marker length.
+
+        (tile_part_header.tile_part_length as usize)
+            .checked_sub(12)
+            .ok_or("tile-part length shorter than header")?
+    };
+
+    let start = reader.offset();
+
+    let tile = &mut tiles[tile_part_header.tile_index as usize];
+    let num_components = tile.component_infos.len();
+
+    loop {
+        let Some(marker) = reader.peek_marker() else {
+            warn!(
+                "expected marker in tile-part, but didn't find one. tile \
+            part will be ignored."
+            );
+
+            return Ok(());
+        };
+
+        match marker {
+            markers::SOD => {
+                reader.read_marker()?;
+                break;
+            }
+            // COD, COC, QCD and QCC should only be used in the _first_
+            // tile-part header, if they appear at all.
+            markers::COD => {
+                reader.read_marker()?;
+                let cod =
+                    crate::codestream::cod_marker(reader).ok_or("failed to read COD marker")?;
+
+                if first {
+                    tile.mct = cod.mct;
+                    tile.num_layers = cod.num_layers;
+                    tile.progression_order = cod.progression_order;
+
+                    for component in &mut tile.component_infos {
+                        component.coding_style = cod.component_parameters.clone();
+                    }
+                } else {
+                    warn!("encountered unexpected COD marker in tile-part header");
+                }
+            }
+            markers::COC => {
+                reader.read_marker()?;
+
+                let (component_index, coc) =
+                    crate::codestream::coc_marker(reader, num_components as u16)
+                        .ok_or("failed to read COC marker")?;
+
+                if first {
+                    tile.component_infos
+                        .get_mut(component_index as usize)
+                        .ok_or("invalid component index in tile-part header")?
+                        .coding_style = coc;
+                } else {
+                    warn!("encountered unexpected COC marker in tile-part header");
+                }
+            }
+            markers::QCD => {
+                reader.read_marker()?;
+                let qcd =
+                    crate::codestream::qcd_marker(reader).ok_or("failed to read QCD marker")?;
+
+                if first {
+                    for component_info in &mut tile.component_infos {
+                        component_info.quantization_info = qcd.clone();
+                    }
+                } else {
+                    warn!("encountered unexpected QCD marker in tile-part header");
+                }
+            }
+            markers::QCC => {
+                reader.read_marker()?;
+                let (component_index, qcc) =
+                    crate::codestream::qcc_marker(reader, num_components as u16)
+                        .ok_or("failed to read QCC marker")?;
+
+                if first {
+                    tile.component_infos
+                        .get_mut(component_index as usize)
+                        .ok_or("invalid component index in tile-part header")?
+                        .quantization_info = qcc.clone();
+                } else {
+                    warn!("encountered unexpected QCC marker in tile-part header");
+                }
+            }
+            markers::EOC => break,
+            _ => {
+                reader.read_marker()?;
+                skip_marker_segment(reader)
+                    .ok_or("failed to skip a marker during tile part parsing")?;
+            }
+        }
+    }
+
+    for ci in &tile.component_infos {
+        if ci
+            .coding_style
+            .parameters
+            .code_block_style
+            .selective_arithmetic_coding_bypass
+        {
+            return Err("unsupported code-block style features encountered during decoding");
+        }
+    }
+
+    let remaining_bytes = if let Some(len) = data_len.checked_sub(reader.offset() - start) {
+        len
+    } else {
+        warn!("didn't find sufficient data in tile part");
+
+        return Ok(());
+    };
+
+    tile.tile_parts.push(
+        reader
+            .read_bytes(remaining_bytes)
+            .ok_or("failed to get tile part data")?,
+    );
+
+    Ok(())
+}
+
+/// A tile, instantiated to a specific component.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct ComponentTile<'a> {
+    /// The underlying tile.
     pub(crate) tile: &'a Tile<'a>,
-}
-
-pub(crate) struct TileInstance<'a> {
-    pub(crate) resolution: u16,
+    /// The information of the component of the tile.
     pub(crate) component_info: &'a ComponentInfo,
-    pub(crate) tile_component_rect: IntRect,
-    pub(crate) resolution_transformed_rect: IntRect,
+    /// The rectangle of the component tile.
+    pub(crate) rect: IntRect,
 }
 
-impl<'a> TileInstance<'a> {
-    pub(crate) fn ppx(&self) -> u8 {
-        self.component_info
-            .coding_style_parameters
+impl<'a> ComponentTile<'a> {
+    pub(crate) fn new(tile: &'a Tile<'a>, component_info: &'a ComponentInfo) -> Self {
+        let tile_rect = tile.rect;
+
+        let rect = if component_info.size_info.horizontal_resolution == 1
+            && component_info.size_info.vertical_resolution == 1
+        {
+            tile_rect
+        } else {
+            // As described in B-12.
+            let t_x0 = tile_rect
+                .x0
+                .div_ceil(component_info.size_info.horizontal_resolution as u32);
+            let t_y0 = tile_rect
+                .y0
+                .div_ceil(component_info.size_info.vertical_resolution as u32);
+            let t_x1 = tile_rect
+                .x1
+                .div_ceil(component_info.size_info.horizontal_resolution as u32);
+            let t_y1 = tile_rect
+                .y1
+                .div_ceil(component_info.size_info.vertical_resolution as u32);
+
+            IntRect::from_ltrb(t_x0, t_y0, t_x1, t_y1)
+        };
+
+        ComponentTile {
+            tile,
+            component_info,
+            rect,
+        }
+    }
+
+    pub(crate) fn resolution_tiles(&self) -> impl IntoIterator<Item = ResolutionTile<'_>> {
+        (0..self
+            .component_info
+            .coding_style
             .parameters
-            .precinct_exponents[self.resolution as usize]
-            .0
+            .num_resolution_levels)
+            .map(|r| ResolutionTile::new(*self, r))
+    }
+}
+
+/// A tile instantiated to a specific resolution of a component tile.
+pub(crate) struct ResolutionTile<'a> {
+    /// The resolution of the tile.
+    pub(crate) resolution: u16,
+    /// The decomposition level of the tile.
+    pub(crate) decomposition_level: u16,
+    /// The underlying component tile.
+    pub(crate) component_tile: ComponentTile<'a>,
+    /// The rectangle of the resolution tile.
+    pub(crate) rect: IntRect,
+}
+
+impl<'a> ResolutionTile<'a> {
+    pub(crate) fn new(component_tile: ComponentTile, resolution: u16) -> ResolutionTile {
+        assert!(
+            component_tile
+                .component_info
+                .coding_style
+                .parameters
+                .num_resolution_levels
+                > resolution
+        );
+
+        let rect = {
+            // See formula B-14.
+            let n_l = component_tile
+                .component_info
+                .coding_style
+                .parameters
+                .num_decomposition_levels;
+
+            let tx0 = component_tile
+                .rect
+                .x0
+                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
+            let ty0 = component_tile
+                .rect
+                .y0
+                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
+            let tx1 = component_tile
+                .rect
+                .x1
+                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
+            let ty1 = component_tile
+                .rect
+                .y1
+                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
+
+            IntRect::from_ltrb(tx0, ty0, tx1, ty1)
+        };
+
+        // Decomposition level and resolution level are inversely related
+        // to each other. In addition to that, there is always one more
+        // resolution than decomposition levels (resolution level 0 only
+        // include the LL subband of the N_L decomposition, resolution level
+        // 1 includes the HL, LH and HH subbands of the N_L decomposition.
+        let decomposition_level = {
+            if resolution == 0 {
+                component_tile
+                    .component_info
+                    .coding_style
+                    .parameters
+                    .num_decomposition_levels
+            } else {
+                component_tile
+                    .component_info
+                    .coding_style
+                    .parameters
+                    .num_decomposition_levels
+                    - (resolution - 1)
+            }
+        };
+
+        ResolutionTile {
+            resolution,
+            decomposition_level,
+            component_tile,
+            rect,
+        }
     }
 
-    pub(crate) fn ppy(&self) -> u8 {
-        self.component_info
-            .coding_style_parameters
-            .parameters
-            .precinct_exponents[self.resolution as usize]
-            .1
-    }
+    pub(crate) fn sub_band_rect(&self, sub_band_type: SubBandType) -> IntRect {
+        // This is the only permissible sub-band type for the given resolution.
+        if self.resolution == 0 {
+            assert_eq!(sub_band_type, SubBandType::LowLow);
+        }
 
-    pub(crate) fn resolution_transformed_rect(&self) -> IntRect {
-        self.resolution_transformed_rect
-    }
-
-    pub(crate) fn sub_band_rect(
-        &self,
-        sub_band_type: SubbandType,
-        decomposition_level: u16,
-    ) -> IntRect {
         // Formula B-15.
 
-        let xo_b = if matches!(sub_band_type, SubbandType::HighLow | SubbandType::HighHigh) {
+        let xo_b = if matches!(sub_band_type, SubBandType::HighLow | SubBandType::HighHigh) {
             1
         } else {
             0
         };
-        let yo_b = if matches!(sub_band_type, SubbandType::LowHigh | SubbandType::HighHigh) {
+        let yo_b = if matches!(sub_band_type, SubBandType::LowHigh | SubBandType::HighHigh) {
             1
         } else {
             0
         };
 
-        let numerator_x = 2u32.pow(decomposition_level as u32 - 1) * xo_b;
-        let numerator_y = 2u32.pow(decomposition_level as u32 - 1) * yo_b;
-        let denominator = 2u32.pow(decomposition_level as u32);
+        let numerator_x = 2u32.pow(self.decomposition_level as u32 - 1) * xo_b;
+        let numerator_y = 2u32.pow(self.decomposition_level as u32 - 1) * yo_b;
+        let denominator = 2u32.pow(self.decomposition_level as u32);
 
         let tbx_0 = self
-            .tile_component_rect
+            .component_tile
+            .rect
             .x0
             .saturating_sub(numerator_x)
             .div_ceil(denominator);
         let tbx_1 = self
-            .tile_component_rect
+            .component_tile
+            .rect
             .x1
             .saturating_sub(numerator_x)
             .div_ceil(denominator);
-
         let tby_0 = self
-            .tile_component_rect
+            .component_tile
+            .rect
             .y0
             .saturating_sub(numerator_y)
             .div_ceil(denominator);
         let tby_1 = self
-            .tile_component_rect
+            .component_tile
+            .rect
             .y1
             .saturating_sub(numerator_y)
             .div_ceil(denominator);
@@ -160,25 +437,51 @@ impl<'a> TileInstance<'a> {
         IntRect::from_ltrb(tbx_0, tby_0, tbx_1, tby_1)
     }
 
+    /// The exponent for determining the horizontal size of a precinct.
+    ///
+    /// `PPx` in the specification.
+    pub(crate) fn precinct_exponent_x(&self) -> u8 {
+        self.component_tile
+            .component_info
+            .coding_style
+            .parameters
+            .precinct_exponents[self.resolution as usize]
+            .0
+    }
+
+    /// The exponent for determining the vertical size of a precinct.
+    ///
+    /// `PPx` in the specification.
+    pub(crate) fn precinct_exponent_y(&self) -> u8 {
+        self.component_tile
+            .component_info
+            .coding_style
+            .parameters
+            .precinct_exponents[self.resolution as usize]
+            .1
+    }
+
     pub(crate) fn num_precincts_x(&self) -> u32 {
         // See B-16.
-        let IntRect { x0, x1, .. } = self.resolution_transformed_rect;
+        let IntRect { x0, x1, .. } = self.rect;
 
         if x0 == x1 {
             0
         } else {
-            x1.div_ceil(2u32.pow(self.ppx() as u32)) - x0 / 2u32.pow(self.ppx() as u32)
+            x1.div_ceil(2u32.pow(self.precinct_exponent_x() as u32))
+                - x0 / 2u32.pow(self.precinct_exponent_x() as u32)
         }
     }
 
     pub(crate) fn num_precincts_y(&self) -> u32 {
         // See B-16.
-        let IntRect { y0, y1, .. } = self.resolution_transformed_rect;
+        let IntRect { y0, y1, .. } = self.rect;
 
         if y0 == y1 {
             0
         } else {
-            y1.div_ceil(2u32.pow(self.ppy() as u32)) - y0 / 2u32.pow(self.ppy() as u32)
+            y1.div_ceil(2u32.pow(self.precinct_exponent_y() as u32))
+                - y0 / 2u32.pow(self.precinct_exponent_y() as u32)
         }
     }
 
@@ -189,15 +492,16 @@ impl<'a> TileInstance<'a> {
     pub(crate) fn code_block_width(&self) -> u32 {
         // See B-17.
         let xcb = self
+            .component_tile
             .component_info
-            .coding_style_parameters
+            .coding_style
             .parameters
             .code_block_width;
 
         let xcb = if self.resolution > 0 {
-            u8::min(xcb, self.ppx() - 1)
+            u8::min(xcb, self.precinct_exponent_x() - 1)
         } else {
-            u8::min(xcb, self.ppx())
+            u8::min(xcb, self.precinct_exponent_x())
         };
 
         2u32.pow(xcb as u32)
@@ -206,246 +510,42 @@ impl<'a> TileInstance<'a> {
     pub(crate) fn code_block_height(&self) -> u32 {
         // See B-18.
         let ycb = self
+            .component_tile
             .component_info
-            .coding_style_parameters
+            .coding_style
             .parameters
             .code_block_height;
 
         let ycb = if self.resolution > 0 {
-            u8::min(ycb, self.ppy() - 1)
+            u8::min(ycb, self.precinct_exponent_y() - 1)
         } else {
-            u8::min(ycb, self.ppy())
+            u8::min(ycb, self.precinct_exponent_y())
         };
 
         2u32.pow(ycb as u32)
     }
 }
 
-pub(crate) fn read_tiles<'a>(
-    reader: &mut Reader<'a>,
-    main_header: &'a Header,
-) -> Result<Vec<Tile<'a>>, &'static str> {
-    let parsed_tile_parts = {
-        let mut buf = vec![];
-        read_tile_part(reader, main_header, &mut buf)?;
-
-        while reader.peek_marker() == Some(markers::SOT) {
-            read_tile_part(reader, main_header, &mut buf)?;
-        }
-
-        if reader.read_marker()? != markers::EOC {
-            return Err("invalid marker: expected EOC marker");
-        }
-
-        buf.sort_by(|t1, t2| {
-            (t1.tile_index, t1.tile_part_index).cmp(&(t2.tile_index, t2.tile_part_index))
-        });
-
-        buf
-    };
-
-    let mut tiles = (0..main_header.size_data.num_tiles() as usize)
-        .map(|idx| Tile::new(idx as u32, &main_header.size_data))
-        .collect::<Vec<_>>();
-
-    for tile_part in parsed_tile_parts {
-        let cur_tile = tiles
-            .get_mut(tile_part.tile_index as usize)
-            .ok_or("tile part had invalid tile index")?;
-
-        if tile_part.tile_part_index == 0 {
-            cur_tile.component_info = tile_part.component_infos.clone();
-        }
-
-        cur_tile.tile_part_infos.push(TilePartInfo {
-            data: tile_part.data,
-        });
-    }
-
-    Ok(tiles)
-}
-
-struct ParsedTilePart<'a> {
-    tile_index: u16,
-    tile_part_index: u16,
-    component_infos: Vec<ComponentInfo>,
-    data: &'a [u8],
-}
-
-fn read_tile_part<'a>(
-    reader: &mut Reader<'a>,
-    main_header: &Header,
-    tile_parts: &mut Vec<ParsedTilePart<'a>>,
-) -> Result<(), &'static str> {
-    if reader.read_marker()? != markers::SOT {
-        return Err("expected SOT marker at tile-part start");
-    }
-
-    let (mut tile_part_reader, header) = {
-        let sot_marker = sot_marker(reader).ok_or("failed to read SOT marker")?;
-
-        let data = if sot_marker.tile_part_length == 0 {
-            // Data goes until EOC.
-            let data = reader.tail().ok_or("failed to read tile-part payload")?;
-            reader.jump_to_end();
-
-            data
-        } else {
-            // Subtract 12 to account for the marker length.
-            let length = (sot_marker.tile_part_length as usize)
-                .checked_sub(12)
-                .ok_or("tile-part length shorter than header")?;
-
-            let data = reader
-                .tail()
-                .ok_or("failed to read tile-part payload")?
-                .get(..length)
-                .ok_or("tile-part payload shorter than declared")?;
-            // Skip to the very end in the original reader.
-            reader
-                .skip_bytes(length)
-                .ok_or("failed to advance past tile-part payload")?;
-
-            data
-        };
-
-        (Reader::new(data), sot_marker)
-    };
-
-    let num_components = main_header.component_infos.len();
-    let mut cod = None;
-    let mut qcd = None;
-    let mut cod_components = vec![None; num_components];
-    let mut qcd_components = vec![None; num_components];
-
-    loop {
-        match tile_part_reader
-            .peek_marker()
-            .ok_or("failed to peek tile-part marker")?
-        {
-            markers::SOD => {
-                tile_part_reader.read_marker()?;
-                break;
-            }
-            markers::COD => {
-                tile_part_reader.read_marker()?;
-                cod = Some(
-                    crate::codestream::cod_marker(&mut tile_part_reader)
-                        .ok_or("failed to read COD marker")?,
-                );
-            }
-            markers::COC => {
-                tile_part_reader.read_marker()?;
-                let (component_index, coc) =
-                    crate::codestream::coc_marker(&mut tile_part_reader, num_components as u16)
-                        .ok_or("failed to read COC marker")?;
-                cod_components[component_index as usize] = Some(coc);
-            }
-            markers::QCD => {
-                tile_part_reader.read_marker()?;
-                qcd = Some(
-                    crate::codestream::qcd_marker(&mut tile_part_reader)
-                        .ok_or("failed to read QCD marker")?,
-                );
-            }
-            markers::QCC => {
-                tile_part_reader.read_marker()?;
-                let (component_index, qcc) =
-                    crate::codestream::qcc_marker(&mut tile_part_reader, num_components as u16)
-                        .ok_or("failed to read QCC marker")?;
-                qcd_components[component_index as usize] = Some(qcc);
-            }
-            markers::EOC => break,
-            markers::RGN => {
-                tile_part_reader.read_marker()?;
-                let length = tile_part_reader
-                    .read_u16()
-                    .ok_or("failed to read RGN marker length")?;
-                let payload = length
-                    .checked_sub(2)
-                    .ok_or("RGN marker length shorter than header")?
-                    as usize;
-                tile_part_reader
-                    .skip_bytes(payload)
-                    .ok_or("failed to skip RGN payload")?;
-            }
-            markers::PLT => {
-                tile_part_reader.read_marker()?;
-                skip_marker_segment(&mut tile_part_reader).ok_or("failed to skip PLT marker")?;
-            }
-            _ => {
-                return Err("unsupported tile-part marker encountered");
-            }
-        }
-    }
-
-    // Let's ignore the tile part index and just calculate it ourselves.
-    let index = match tile_parts.last() {
-        None => 0,
-        Some(p) => {
-            if p.tile_index != header.tile_index {
-                0
-            } else {
-                p.tile_part_index + 1
-            }
-        }
-    };
-
-    let component_infos = main_header
-        .component_infos
-        .iter()
-        .enumerate()
-        .map(|(idx, i)| ComponentInfo {
-            size_info: i.size_info,
-            coding_style_parameters: cod_components[idx]
-                .clone()
-                .or_else(|| cod.clone().map(|c| c.component_parameters))
-                .unwrap_or(i.coding_style_parameters.clone()),
-            quantization_info: qcd_components[idx]
-                .clone()
-                .or_else(|| qcd.clone())
-                .unwrap_or(i.quantization_info.clone()),
-        })
-        .collect();
-
-    let tile_part = ParsedTilePart {
-        data: tile_part_reader
-            .tail()
-            .ok_or("failed to capture tile-part payload")?,
-        tile_index: header.tile_index,
-        tile_part_index: index,
-        component_infos,
-    };
-
-    tile_parts.push(tile_part);
-
-    Ok(())
-}
-
 struct TilePartHeader {
     tile_index: u16,
     tile_part_length: u32,
-    // This can only be `u8` in theory, but we use u16 so we can handle the
-    // `openjpeg-lossless-rgba-u8-prog0-tile-part-index-overflow` test case.
-    tile_part_index: u16,
-    num_tile_parts: u8,
 }
 
 /// SOT marker (A.4.2).
-pub(crate) fn sot_marker(reader: &mut Reader) -> Option<TilePartHeader> {
+fn sot_marker(reader: &mut Reader) -> Option<TilePartHeader> {
     // Length.
     let _ = reader.read_u16()?;
 
     let tile_index = reader.read_u16()?;
     let tile_part_length = reader.read_u32()?;
-    let tile_part_index = reader.read_byte()? as u16;
-    let num_tile_parts = reader.read_byte()?;
+
+    // We infer those ourselves.
+    let _tile_part_index = reader.read_byte()? as u16;
+    let _num_tile_parts = reader.read_byte()?;
 
     Some(TilePartHeader {
         tile_index,
         tile_part_length,
-        tile_part_index,
-        num_tile_parts,
     })
 }
 
@@ -453,8 +553,9 @@ pub(crate) fn sot_marker(reader: &mut Reader) -> Option<TilePartHeader> {
 mod tests {
     use super::*;
     use crate::codestream::{
-        CodeBlockStyle, CodingStyleFlags, CodingStyleParameters, ComponentCodingStyle,
-        ComponentSizeInfo, QuantizationInfo, QuantizationStyle, WaveletTransform,
+        CodeBlockStyle, CodingStyleComponent, CodingStyleDefault, CodingStyleFlags,
+        CodingStyleParameters, ComponentSizeInfo, QuantizationInfo, QuantizationStyle, SizeData,
+        WaveletTransform,
     };
 
     /// Test case for the example in B.4.
@@ -462,12 +563,12 @@ mod tests {
     fn test_jpeg2000_standard_example_b4() {
         let component_size_info_0 = ComponentSizeInfo {
             precision: 8,
-            is_signed: false,
+            _is_signed: false,
             horizontal_resolution: 1,
             vertical_resolution: 1,
         };
 
-        let dummy_component_coding_style = ComponentCodingStyle {
+        let dummy_component_coding_style = CodingStyleComponent {
             flags: CodingStyleFlags::default(),
             parameters: CodingStyleParameters {
                 num_decomposition_levels: 0,
@@ -487,21 +588,21 @@ mod tests {
         };
 
         let component_info_0 = ComponentInfo {
-            size_info: component_size_info_0.clone(),
-            coding_style_parameters: dummy_component_coding_style.clone(),
+            size_info: component_size_info_0,
+            coding_style: dummy_component_coding_style.clone(),
             quantization_info: dummy_quantization_info.clone(),
         };
 
         let component_size_info_1 = ComponentSizeInfo {
             precision: 8,
-            is_signed: false,
+            _is_signed: false,
             horizontal_resolution: 2,
             vertical_resolution: 2,
         };
 
         let component_info_1 = ComponentInfo {
-            size_info: component_size_info_1.clone(),
-            coding_style_parameters: dummy_component_coding_style.clone(),
+            size_info: component_size_info_1,
+            coding_style: dummy_component_coding_style.clone(),
             quantization_info: dummy_quantization_info.clone(),
         };
 
@@ -524,11 +625,31 @@ mod tests {
         assert_eq!(size_data.num_y_tiles(), 4);
         assert_eq!(size_data.num_tiles(), 16);
 
-        let component_0 = &size_data.component_sizes[0];
-        let component_1 = &size_data.component_sizes[1];
+        let header = Header {
+            size_data,
+            // Just dummy values.
+            global_coding_style: CodingStyleDefault {
+                progression_order: ProgressionOrder::LayerResolutionComponentPosition,
+                num_layers: 0,
+                mct: false,
+                component_parameters: CodingStyleComponent {
+                    flags: Default::default(),
+                    parameters: CodingStyleParameters {
+                        num_decomposition_levels: 0,
+                        num_resolution_levels: 0,
+                        code_block_width: 0,
+                        code_block_height: 0,
+                        code_block_style: Default::default(),
+                        transformation: WaveletTransform::Irreversible97,
+                        precinct_exponents: vec![],
+                    },
+                },
+            },
+            component_infos: vec![],
+        };
 
-        let tile_0_0 = Tile::new(0, &size_data);
-        let coords_0_0 = component_info_0.tile_component_rect(tile_0_0.rect);
+        let tile_0_0 = Tile::new(0, &header);
+        let coords_0_0 = ComponentTile::new(&tile_0_0, &component_info_0).rect;
         assert_eq!(coords_0_0.x0, 152);
         assert_eq!(coords_0_0.y0, 234);
         assert_eq!(coords_0_0.x1, 396);
@@ -536,8 +657,8 @@ mod tests {
         assert_eq!(coords_0_0.width(), 244);
         assert_eq!(coords_0_0.height(), 63);
 
-        let tile_1_0 = Tile::new(1, &size_data);
-        let coords_1_0 = component_info_0.tile_component_rect(tile_1_0.rect);
+        let tile_1_0 = Tile::new(1, &header);
+        let coords_1_0 = ComponentTile::new(&tile_1_0, &component_info_0).rect;
         assert_eq!(coords_1_0.x0, 396);
         assert_eq!(coords_1_0.y0, 234);
         assert_eq!(coords_1_0.x1, 792);
@@ -545,8 +666,8 @@ mod tests {
         assert_eq!(coords_1_0.width(), 396);
         assert_eq!(coords_1_0.height(), 63);
 
-        let tile_0_1 = Tile::new(4, &size_data);
-        let coords_0_1 = component_info_0.tile_component_rect(tile_0_1.rect);
+        let tile_0_1 = Tile::new(4, &header);
+        let coords_0_1 = ComponentTile::new(&tile_0_1, &component_info_0).rect;
         assert_eq!(coords_0_1.x0, 152);
         assert_eq!(coords_0_1.y0, 297);
         assert_eq!(coords_0_1.x1, 396);
@@ -554,8 +675,8 @@ mod tests {
         assert_eq!(coords_0_1.width(), 244);
         assert_eq!(coords_0_1.height(), 297);
 
-        let tile_1_1 = Tile::new(5, &size_data);
-        let coords_1_1 = component_info_0.tile_component_rect(tile_1_1.rect);
+        let tile_1_1 = Tile::new(5, &header);
+        let coords_1_1 = ComponentTile::new(&tile_1_1, &component_info_0).rect;
         assert_eq!(coords_1_1.x0, 396);
         assert_eq!(coords_1_1.y0, 297);
         assert_eq!(coords_1_1.x1, 792);
@@ -563,8 +684,8 @@ mod tests {
         assert_eq!(coords_1_1.width(), 396);
         assert_eq!(coords_1_1.height(), 297);
 
-        let tile_3_3 = Tile::new(15, &size_data);
-        let coords_3_3 = component_info_0.tile_component_rect(tile_3_3.rect);
+        let tile_3_3 = Tile::new(15, &header);
+        let coords_3_3 = ComponentTile::new(&tile_3_3, &component_info_0).rect;
         assert_eq!(coords_3_3.x0, 1188);
         assert_eq!(coords_3_3.y0, 891);
         assert_eq!(coords_3_3.x1, 1432);
@@ -572,7 +693,7 @@ mod tests {
         assert_eq!(coords_3_3.width(), 244);
         assert_eq!(coords_3_3.height(), 63);
 
-        let tile_0_0_comp1 = component_info_1.tile_component_rect(tile_0_0.rect);
+        let tile_0_0_comp1 = ComponentTile::new(&tile_0_0, &component_info_1).rect;
         assert_eq!(tile_0_0_comp1.x0, 76);
         assert_eq!(tile_0_0_comp1.y0, 117);
         assert_eq!(tile_0_0_comp1.x1, 198);
@@ -580,7 +701,7 @@ mod tests {
         assert_eq!(tile_0_0_comp1.width(), 122);
         assert_eq!(tile_0_0_comp1.height(), 32);
 
-        let tile_1_0_comp1 = component_info_1.tile_component_rect(tile_1_0.rect);
+        let tile_1_0_comp1 = ComponentTile::new(&tile_1_0, &component_info_1).rect;
         assert_eq!(tile_1_0_comp1.x0, 198);
         assert_eq!(tile_1_0_comp1.y0, 117);
         assert_eq!(tile_1_0_comp1.x1, 396);
@@ -588,7 +709,7 @@ mod tests {
         assert_eq!(tile_1_0_comp1.width(), 198);
         assert_eq!(tile_1_0_comp1.height(), 32);
 
-        let tile_0_1_comp1 = component_info_1.tile_component_rect(tile_0_1.rect);
+        let tile_0_1_comp1 = ComponentTile::new(&tile_0_1, &component_info_1).rect;
         assert_eq!(tile_0_1_comp1.x0, 76);
         assert_eq!(tile_0_1_comp1.y0, 149);
         assert_eq!(tile_0_1_comp1.x1, 198);
@@ -596,7 +717,7 @@ mod tests {
         assert_eq!(tile_0_1_comp1.width(), 122);
         assert_eq!(tile_0_1_comp1.height(), 148);
 
-        let tile_1_1_comp1 = component_info_1.tile_component_rect(tile_1_1.rect);
+        let tile_1_1_comp1 = ComponentTile::new(&tile_1_1, &component_info_1).rect;
         assert_eq!(tile_1_1_comp1.x0, 198);
         assert_eq!(tile_1_1_comp1.y0, 149);
         assert_eq!(tile_1_1_comp1.x1, 396);
@@ -604,8 +725,8 @@ mod tests {
         assert_eq!(tile_1_1_comp1.width(), 198);
         assert_eq!(tile_1_1_comp1.height(), 148);
 
-        let tile_2_1 = Tile::new(6, &size_data);
-        let tile_2_1_comp1 = component_info_1.tile_component_rect(tile_2_1.rect);
+        let tile_2_1 = Tile::new(6, &header);
+        let tile_2_1_comp1 = ComponentTile::new(&tile_2_1, &component_info_1).rect;
         assert_eq!(tile_2_1_comp1.x0, 396);
         assert_eq!(tile_2_1_comp1.y0, 149);
         assert_eq!(tile_2_1_comp1.x1, 594);
