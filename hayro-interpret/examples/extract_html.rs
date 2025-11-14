@@ -12,10 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
-    colog::default_builder()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
-
     let args: Vec<String> = std::env::args().collect();
     let relative_path = args
         .get(1)
