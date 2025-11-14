@@ -4,7 +4,9 @@ use crate::cache::Cache;
 use crate::context::Context;
 use crate::device::Device;
 use crate::font::cid::Type0Font;
-use crate::font::generated::{mac_expert, mac_os_roman, mac_roman, standard, win_ansi};
+use crate::font::generated::{
+    glyph_names, mac_expert, mac_os_roman, mac_roman, standard, win_ansi,
+};
 use crate::font::true_type::TrueTypeFont;
 use crate::font::type1::Type1Font;
 use crate::font::type3::Type3;
@@ -60,16 +62,16 @@ impl Glyph<'_> {
     /// represents. The exact fallback chain depends on the font type:
     ///
     /// **For Outline Fonts (Type1, TrueType, CFF):**
-    /// 1. ToUnicode CMap (if present in font)
+    /// 1. ToUnicode CMap (if present)
     /// 2. Glyph name → Unicode (via Adobe Glyph List)
-    /// 3. Unicode naming conventions (e.g., "uni0041", "u0041") [TrueType only]
+    /// 3. Unicode naming conventions (e.g., "uni0041", "u0041")
     ///
     /// **For CID Fonts (Type0):**
-    /// 1. ToUnicode CMap (if present in font)
+    /// 1. ToUnicode CMap (if present)
     /// 2. Identity CMap heuristic (treats CID as Unicode code point)
     ///
     /// **For Type3 Fonts:**
-    /// 1. ToUnicode CMap (if present in font) - only option
+    /// 1. ToUnicode CMap (if present) - only option
     ///
     /// Returns `None` if the Unicode value cannot be determined.
     pub fn as_unicode(&self) -> Option<char> {
@@ -548,4 +550,28 @@ impl Default for FallbackFontQuery {
             is_small_cap: false,
         }
     }
+}
+
+/// Convert a glyph name to a Unicode character, if possible.
+/// An incomplete implementation of the Adobe Glyph List Specification
+/// https://github.com/adobe-type-tools/agl-specification
+pub(crate) fn glyph_name_to_unicode(name: &str) -> Option<char> {
+    if let Some(unicode_str) = glyph_names::get(name) {
+        return unicode_str.chars().next();
+    }
+
+    let convert = |input: &str| u32::from_str_radix(input, 16).ok().and_then(char::from_u32);
+
+    return name
+        .starts_with("uni")
+        .then(|| name.get(3..).and_then(convert))
+        .or_else(|| {
+            name.starts_with("u")
+                .then(|| name.get(1..).and_then(convert))
+        })
+        .flatten()
+        .or_else(|| {
+            warn!("failed to map glyph name {} to unicode", name);
+            None
+        });
 }

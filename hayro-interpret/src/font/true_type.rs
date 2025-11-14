@@ -2,7 +2,7 @@ use crate::CacheKey;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::generated::{glyph_names, mac_os_roman, mac_roman};
-use crate::font::{Encoding, FontFlags};
+use crate::font::{Encoding, FontFlags, glyph_name_to_unicode};
 use crate::util::{CodeMapExt, OptionLog};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -240,22 +240,13 @@ impl TrueTypeFont {
         }
 
         // 2. Try glyph name → Unicode (via encoding)
-        if let Some(glyph_name) = self.code_to_name(code as u8) {
-            // Try Adobe Glyph List
-            if let Some(unicode_str) = glyph_names::get(glyph_name) {
-                return unicode_str.chars().next();
-            }
-            warn!(
-                "TrueTypeFont::char_code_to_unicode: failed to map code {} to unicode via glyph name {:?}",
-                code, glyph_name
-            );
-        }
+        self.code_to_name(code as u8)
+            .and_then(glyph_name_to_unicode)
 
-        // TODO: hayro-tests/pdfs/custom/font_truetype_7.pdf
+        // TODO: The test PDFs below fail (but mutool can render them correctly).
+        // There is likely some other strategy that requires processing the font tables
+        // hayro-tests/pdfs/custom/font_truetype_7.pdf
         // hayro-tests/pdfs/custom/font_truetype_6.pdf
-        // hayro-tests/pdfs/custom/font_truetype_3.pdf
-
-        None
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 fn main() {
     colog::default_builder()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Warn)
         .init();
 
     let args: Vec<String> = std::env::args().collect();

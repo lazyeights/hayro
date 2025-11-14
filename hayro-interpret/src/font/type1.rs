@@ -4,7 +4,7 @@ use crate::font::generated::glyph_names;
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::standard_font::{StandardFont, StandardFontBlob, select_standard_font};
 use crate::font::true_type::{read_encoding, read_widths};
-use crate::font::{Encoding, FallbackFontQuery, FontQuery};
+use crate::font::{Encoding, FallbackFontQuery, FontQuery, glyph_name_to_unicode};
 use crate::{CacheKey, FontResolverFn};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
@@ -237,18 +237,8 @@ impl StandardKind {
 
     fn char_code_to_unicode(&self, code: u8) -> Option<char> {
         // Try glyph name → Unicode (via encoding)
-        if let Some(glyph_name) = self.code_to_ps_name(code) {
-            if let Some(unicode_str) = glyph_names::get(glyph_name) {
-                return unicode_str.chars().next();
-            }
-
-            warn!(
-                "StandardKind::char_code_to_unicode: failed to map code {} to unicode via glyph name {:?}",
-                code, glyph_name
-            );
-        }
-
-        None
+        self.code_to_ps_name(code as u8)
+            .and_then(glyph_name_to_unicode)
     }
 }
 
@@ -338,20 +328,7 @@ impl Type1Kind {
         };
 
         // 2. Try glyph name → Unicode (via encoding)
-        if let Some(glyph_name) = glyph_name {
-            // Try Adobe Glyph List
-            if let Some(unicode_str) = glyph_names::get(glyph_name) {
-                return unicode_str.chars().next();
-            }
-            warn!(
-                "Type1Kind::char_code_to_unicode: failed to map code {} to unicode via glyph name {:?}",
-                code, glyph_name
-            );
-        }
-
-        // TODO: hayro-tests/pdfs/custom/font_type1_9.pdf
-        // hayro-tests/pdfs/custom/text_rendering_4.pdf
-        None
+        glyph_name.and_then(glyph_name_to_unicode)
     }
 }
 
@@ -421,22 +398,6 @@ impl CffKind {
         };
 
         // Try glyph name → Unicode
-        if let Some(ch) = glyph_name
-            .and_then(|name| glyph_names::get(name))
-            .and_then(|unicode_str| unicode_str.chars().next())
-        {
-            return Some(ch);
-        }
-
-        warn!(
-            "CffKind::char_code_to_unicode: failed to map code {} to unicode via glyph name {:?}",
-            code, glyph_name
-        );
-        // TODO: Complete remainder of https://github.com/adobe-type-tools/agl-specification
-        // ( if the component is of the form ‘uni’ or  if the component is of the form ‘u’
-        // Look at: TrueTypeFont::map_code)
-        // Test file: hayro-tests/pdfs/custom/font_type1_cff_6.pdf
-
-        None
+        glyph_name.and_then(glyph_name_to_unicode)
     }
 }
