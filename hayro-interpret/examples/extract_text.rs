@@ -4,14 +4,10 @@ use hayro_interpret::{
     PathDrawMode, SoftMask, interpret_page,
 };
 use hayro_syntax::Pdf;
-use hayro_syntax::object::dict::keys::{BASE_ENCODING, FONT_NAME, TYPE};
-use hayro_syntax::object::{Name, Object};
-
-use log::info;
 
 use std::fmt::Write;
 
-use kurbo::{Affine, BezPath, Point, Rect};
+use kurbo::{Affine, BezPath, Rect};
 use std::path::PathBuf;
 use std::sync::Arc;
 
