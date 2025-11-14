@@ -164,7 +164,9 @@ fn parse_tile_part<'a>(
                     tile.progression_order = cod.progression_order;
 
                     for component in &mut tile.component_infos {
-                        component.coding_style = cod.component_parameters.clone();
+                        component.coding_style.flags.raw |= cod.component_parameters.flags.raw;
+                        component.coding_style.parameters =
+                            cod.component_parameters.clone().parameters;
                     }
                 } else {
                     warn!("encountered unexpected COD marker in tile-part header");
@@ -178,10 +180,13 @@ fn parse_tile_part<'a>(
                         .ok_or("failed to read COC marker")?;
 
                 if first {
-                    tile.component_infos
+                    let old = tile
+                        .component_infos
                         .get_mut(component_index as usize)
-                        .ok_or("invalid component index in tile-part header")?
-                        .coding_style = coc;
+                        .ok_or("invalid component index in tile-part header")?;
+
+                    old.coding_style.parameters = coc.parameters;
+                    old.coding_style.flags.raw |= coc.flags.raw;
                 } else {
                     warn!("encountered unexpected COC marker in tile-part header");
                 }
@@ -220,17 +225,6 @@ fn parse_tile_part<'a>(
                 skip_marker_segment(reader)
                     .ok_or("failed to skip a marker during tile part parsing")?;
             }
-        }
-    }
-
-    for ci in &tile.component_infos {
-        if ci
-            .coding_style
-            .parameters
-            .code_block_style
-            .selective_arithmetic_coding_bypass
-        {
-            return Err("unsupported code-block style features encountered during decoding");
         }
     }
 
@@ -336,22 +330,14 @@ impl<'a> ResolutionTile<'a> {
                 .parameters
                 .num_decomposition_levels;
 
-            let tx0 = component_tile
-                .rect
-                .x0
-                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
-            let ty0 = component_tile
-                .rect
-                .y0
-                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
-            let tx1 = component_tile
-                .rect
-                .x1
-                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
-            let ty1 = component_tile
-                .rect
-                .y1
-                .div_ceil(2u32.pow(n_l as u32 - resolution as u32));
+            let tx0 = (component_tile.rect.x0 as u64)
+                .div_ceil(2u64.pow(n_l as u32 - resolution as u32)) as u32;
+            let ty0 = (component_tile.rect.y0 as u64)
+                .div_ceil(2u64.pow(n_l as u32 - resolution as u32)) as u32;
+            let tx1 = (component_tile.rect.x1 as u64)
+                .div_ceil(2u64.pow(n_l as u32 - resolution as u32)) as u32;
+            let ty1 = (component_tile.rect.y1 as u64)
+                .div_ceil(2u64.pow(n_l as u32 - resolution as u32)) as u32;
 
             IntRect::from_ltrb(tx0, ty0, tx1, ty1)
         };
@@ -405,34 +391,22 @@ impl<'a> ResolutionTile<'a> {
             0
         };
 
-        let numerator_x = 2u32.pow(self.decomposition_level as u32 - 1) * xo_b;
-        let numerator_y = 2u32.pow(self.decomposition_level as u32 - 1) * yo_b;
-        let denominator = 2u32.pow(self.decomposition_level as u32);
+        let numerator_x = 2u64.pow(self.decomposition_level as u32 - 1) * xo_b as u64;
+        let numerator_y = 2u64.pow(self.decomposition_level as u32 - 1) * yo_b as u64;
+        let denominator = 2u64.pow(self.decomposition_level as u32);
 
-        let tbx_0 = self
-            .component_tile
-            .rect
-            .x0
+        let tbx_0 = (self.component_tile.rect.x0 as u64)
             .saturating_sub(numerator_x)
-            .div_ceil(denominator);
-        let tbx_1 = self
-            .component_tile
-            .rect
-            .x1
+            .div_ceil(denominator) as u32;
+        let tbx_1 = (self.component_tile.rect.x1 as u64)
             .saturating_sub(numerator_x)
-            .div_ceil(denominator);
-        let tby_0 = self
-            .component_tile
-            .rect
-            .y0
+            .div_ceil(denominator) as u32;
+        let tby_0 = (self.component_tile.rect.y0 as u64)
             .saturating_sub(numerator_y)
-            .div_ceil(denominator);
-        let tby_1 = self
-            .component_tile
-            .rect
-            .y1
+            .div_ceil(denominator) as u32;
+        let tby_1 = (self.component_tile.rect.y1 as u64)
             .saturating_sub(numerator_y)
-            .div_ceil(denominator);
+            .div_ceil(denominator) as u32;
 
         IntRect::from_ltrb(tbx_0, tby_0, tbx_1, tby_1)
     }

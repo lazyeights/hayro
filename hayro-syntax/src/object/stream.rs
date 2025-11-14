@@ -232,9 +232,13 @@ pub struct ImageData {
     /// An optional alpha channel of the image.
     pub alpha: Option<Vec<u8>>,
     /// The color space of the image.
-    pub color_space: ImageColorSpace,
+    pub color_space: Option<ImageColorSpace>,
     /// The bits per component of the image.
     pub bits_per_component: u8,
+    /// The width of the image.
+    pub width: u32,
+    /// The height of the image.
+    pub height: u32,
 }
 
 /// The result of applying a filter.

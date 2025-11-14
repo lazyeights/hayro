@@ -75,6 +75,10 @@ fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
                 reader.read_marker()?;
                 com_marker(reader).ok_or("failed to read COM marker")?;
             }
+            markers::CRG => {
+                reader.read_marker()?;
+                skip_marker_segment(reader);
+            }
             _ => {
                 return Err("unsupported marker encountered in main header");
             }
@@ -92,27 +96,49 @@ fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
             size_info: *csi,
             coding_style: cod_components[idx]
                 .clone()
+                .map(|mut c| {
+                    c.flags.raw |= cod.component_parameters.flags.raw;
+
+                    c
+                })
                 .unwrap_or(cod.component_parameters.clone()),
             quantization_info: qcd_components[idx].clone().unwrap_or(qcd.clone()),
         })
         .collect();
 
-    for ci in &component_infos {
-        if ci
-            .coding_style
-            .parameters
-            .code_block_style
-            .selective_arithmetic_coding_bypass
-        {
-            return Err("unsupported code-block style features encountered during decoding");
-        }
-    }
-
-    Ok(Header {
+    let header = Header {
         size_data,
         global_coding_style: cod.clone(),
         component_infos,
-    })
+    };
+
+    validate(&header)?;
+
+    Ok(header)
+}
+
+fn validate(header: &Header) -> Result<(), &'static str> {
+    for info in &header.component_infos {
+        let max_resolution_idx = info.coding_style.parameters.num_resolution_levels - 1;
+        let quantization_style = info.quantization_info.quantization_style;
+        let num_precinct_exponents = info.quantization_info.step_sizes.len();
+
+        if num_precinct_exponents == 0 {
+            return Err("missing exponents for precinct sizes");
+        } else if matches!(
+            quantization_style,
+            QuantizationStyle::NoQuantization | QuantizationStyle::ScalarExpounded
+        ) {
+            // See the accesses in the `exponent_mantissa` method. The largest
+            // access is 1 + (max_resolution_idx - 1) * 3 + 2.
+
+            if 1 + (max_resolution_idx as usize - 1) * 3 + 2 >= num_precinct_exponents {
+                return Err("not enough exponents were provided in header");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +170,7 @@ impl ComponentInfo {
                 let entry = if resolution == 0 {
                     step_sizes[0]
                 } else {
-                    step_sizes[(1 + (resolution - 1) * 3 + sb_index) as usize]
+                    step_sizes[1 + (resolution as usize - 1) * 3 + sb_index as usize]
                 };
 
                 (entry.exponent, entry.mantissa)
@@ -169,6 +195,10 @@ impl ComponentInfo {
 
     pub(crate) fn num_resolution_levels(&self) -> u16 {
         self.coding_style.parameters.num_resolution_levels
+    }
+
+    pub(crate) fn code_block_style(&self) -> CodeBlockStyle {
+        self.coding_style.parameters.code_block_style
     }
 }
 
@@ -215,7 +245,7 @@ impl WaveletTransform {
 /// Coding style flags (Table A.13).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CodingStyleFlags {
-    raw: u8,
+    pub(crate) raw: u8,
 }
 
 impl CodingStyleFlags {
@@ -435,12 +465,6 @@ fn size_marker(reader: &mut Reader) -> Result<SizeData, &'static str> {
         if comp.precision == 0 || comp.vertical_resolution == 0 || comp.horizontal_resolution == 0 {
             return Err("invalid component metadata");
         }
-
-        if comp.precision > 8 {
-            return Err(
-                "unsupported component precision: only components up to 8 bits are handled",
-            );
-        }
     }
 
     Ok(size_data)
@@ -502,10 +526,10 @@ fn coding_style_parameters(
     reader: &mut Reader,
     coding_style: &CodingStyleFlags,
 ) -> Option<CodingStyleParameters> {
-    let num_decomposition_levels = reader.read_byte()? as u16;
+    let num_decomposition_levels = (reader.read_byte()? as u16).min(32);
     let num_resolution_levels = num_decomposition_levels.checked_add(1)?;
-    let code_block_width = reader.read_byte()? + 2;
-    let code_block_height = reader.read_byte()? + 2;
+    let code_block_width = reader.read_byte()?.checked_add(2)?;
+    let code_block_height = reader.read_byte()?.checked_add(2)?;
     let code_block_style = CodeBlockStyle::from_u8(reader.read_byte()?);
     let transformation = WaveletTransform::from_u8(reader.read_byte()?).ok()?;
 
@@ -615,7 +639,7 @@ pub(crate) fn qcd_marker(reader: &mut Reader) -> Option<QuantizationInfo> {
     let quantization_style = QuantizationStyle::from_u8(sqcd_val & 0x1F).ok()?;
     let guard_bits = (sqcd_val >> 5) & 0x07;
 
-    let remaining_bytes = (length - 3) as usize;
+    let remaining_bytes = length.checked_sub(3)? as usize;
 
     let mut parameters = quantization_parameters(reader, quantization_style, remaining_bytes)?;
     parameters.guard_bits = guard_bits;
@@ -638,7 +662,10 @@ pub(crate) fn qcc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, Quantiz
     let guard_bits = (sqcc_val >> 5) & 0x07;
 
     let component_index_size = if csiz < 257 { 1 } else { 2 };
-    let remaining_bytes = (length - 2 - component_index_size - 1) as usize;
+    let remaining_bytes = (length
+        .checked_sub(2)?
+        .checked_sub(component_index_size)?
+        .checked_sub(1)?) as usize;
 
     let mut parameters = quantization_parameters(reader, quantization_style, remaining_bytes)?;
     parameters.guard_bits = guard_bits;

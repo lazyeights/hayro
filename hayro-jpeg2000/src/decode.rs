@@ -236,10 +236,13 @@ pub(crate) struct CodeBlock {
     pub(crate) missing_bit_planes: u8,
     pub(crate) number_of_coding_passes: u32,
     pub(crate) l_block: u32,
+    pub(crate) non_empty_layer_count: u32,
 }
 
 pub(crate) struct Segment<'a> {
-    pub(crate) length: u32,
+    pub(crate) idx: u32,
+    pub(crate) coding_pases: u32,
+    pub(crate) data_length: u32,
     pub(crate) data: &'a [u8],
 }
 
@@ -299,7 +302,7 @@ impl<'a> TileDecodeContext<'a> {
             channel_data.push(ChannelData {
                 container: vec![
                     0.0;
-                    (header.size_data.reference_grid_width * header.size_data.reference_grid_height)
+                    (header.size_data.image_width() * header.size_data.image_height())
                         as usize
                 ],
                 // Will be set later on, because that data only exists in the
@@ -568,6 +571,7 @@ fn build_code_blocks(
                 l_block: 3,
                 number_of_coding_passes: 0,
                 layers: start..end,
+                non_empty_layer_count: 0,
             });
 
             x += code_block_width;
@@ -627,7 +631,7 @@ fn get_code_block_data_inner<'a>(
         }
 
         let mut reader = BitReader::new(data);
-        let zero_length = reader.read_packet_header_bits(1)? == 0;
+        let zero_length = reader.read_bits_with_stuffing(1)? == 0;
 
         // B.10.3 Zero length packet
         // "The first bit in the packet header denotes whether the packet has a length of zero
@@ -675,7 +679,7 @@ fn get_code_block_data_inner<'a>(
                         let segments = &mut storage.segments[segments.clone()];
 
                         for segment in segments {
-                            segment.data = data_reader.read_bytes(segment.length as usize)?
+                            segment.data = data_reader.read_bytes(segment.data_length as usize)?
                         }
                     }
                 }
@@ -706,7 +710,7 @@ fn get_code_block_lengths(
             // a single bit is used to represent the information, where a 1
             // means that the code-block is included in this layer and a 0 means
             // that it is not."
-            reader.read_packet_header_bits(1)? == 1
+            reader.read_bits_with_stuffing(1)? == 1
         } else {
             // "For code-blocks that have not been previously included in any packet,
             // this information is signalled with a separate tag tree code for each precinct
@@ -769,59 +773,64 @@ fn get_code_block_lengths(
         // "The number of coding passes included in this packet from each code-block is
         // identified in the packet header using the codewords shown in Table B.4. This
         // table provides for the possibility of signalling up to 164 coding passes.
-        let added_coding_passes = if reader.peak_packet_header_bits(9) == Some(0x1ff) {
-            reader.read_packet_header_bits(9)?;
-            reader.read_packet_header_bits(7)? + 37
-        } else if reader.peak_packet_header_bits(4) == Some(0x0f) {
-            reader.read_packet_header_bits(4)?;
+        let added_coding_passes = if reader.peak_bits_with_stuffing(9) == Some(0x1ff) {
+            reader.read_bits_with_stuffing(9)?;
+            reader.read_bits_with_stuffing(7)? + 37
+        } else if reader.peak_bits_with_stuffing(4) == Some(0x0f) {
+            reader.read_bits_with_stuffing(4)?;
             // TODO: Validate that sequence is not 1111 1
-            reader.read_packet_header_bits(5)? + 6
-        } else if reader.peak_packet_header_bits(4) == Some(0b1110) {
-            reader.read_packet_header_bits(4)?;
+            reader.read_bits_with_stuffing(5)? + 6
+        } else if reader.peak_bits_with_stuffing(4) == Some(0b1110) {
+            reader.read_bits_with_stuffing(4)?;
             5
-        } else if reader.peak_packet_header_bits(4) == Some(0b1101) {
-            reader.read_packet_header_bits(4)?;
+        } else if reader.peak_bits_with_stuffing(4) == Some(0b1101) {
+            reader.read_bits_with_stuffing(4)?;
             4
-        } else if reader.peak_packet_header_bits(4) == Some(0b1100) {
-            reader.read_packet_header_bits(4)?;
+        } else if reader.peak_bits_with_stuffing(4) == Some(0b1100) {
+            reader.read_bits_with_stuffing(4)?;
             3
-        } else if reader.peak_packet_header_bits(2) == Some(0b10) {
-            reader.read_packet_header_bits(2)?;
+        } else if reader.peak_bits_with_stuffing(2) == Some(0b10) {
+            reader.read_bits_with_stuffing(2)?;
             2
-        } else if reader.peak_packet_header_bits(1) == Some(0) {
-            reader.read_packet_header_bits(1)?;
+        } else if reader.peak_bits_with_stuffing(1) == Some(0) {
+            reader.read_bits_with_stuffing(1)?;
             1
         } else {
             return None;
         };
 
-        code_block.number_of_coding_passes += added_coding_passes;
-
         trace!("number of coding passes: {}", added_coding_passes);
 
         let mut k = 0;
 
-        while reader.read_packet_header_bits(1)? == 1 {
+        while reader.read_bits_with_stuffing(1)? == 1 {
             k += 1;
         }
 
         code_block.l_block += k;
 
-        let (num_segments, coding_passes_per_segment) = if !component_info
-            .coding_style
-            .parameters
-            .code_block_style
-            .termination_on_each_pass
-        {
-            (1, added_coding_passes)
-        } else {
-            (added_coding_passes, 1)
+        let previous_layers_passes = code_block.number_of_coding_passes;
+        let cumulative_passes = previous_layers_passes + added_coding_passes;
+
+        let get_segment = |code_block_idx: u32| {
+            if component_info.code_block_style().termination_on_each_pass {
+                code_block_idx
+            } else if component_info
+                .code_block_style()
+                .selective_arithmetic_coding_bypass
+            {
+                segment_idx_for_bypass(code_block_idx)
+            } else {
+                code_block.non_empty_layer_count
+            }
         };
 
         let start = storage.segments.len();
 
-        for i in 0..num_segments {
+        let mut push_segment = |segment: u32, coding_passes_for_segment: u32| {
             let length = {
+                assert!(coding_passes_for_segment > 0);
+
                 // "A codeword segment is the number of bytes contributed to a packet by a
                 // code-block. The length of a codeword segment is represented by a binary number of length:
                 // bits = Lblock + floor(log_2(coding passes added))
@@ -833,25 +842,63 @@ fn get_code_block_lengths(
                 // zero, the value of Lblock is incremented by k. While Lblock can only increase,
                 // the number of bits used to signal the length of the code-block contribution can
                 // increase or decrease depending on the number of coding passes included."
-                let length_bits = code_block.l_block + coding_passes_per_segment.ilog2();
-                reader.read_packet_header_bits(length_bits as u8)
+                let length_bits = code_block.l_block + coding_passes_for_segment.ilog2();
+                reader.read_bits_with_stuffing(length_bits as u8)
             }?;
 
             storage.segments.push(Segment {
-                length,
+                idx: segment,
+                data_length: length,
+                coding_pases: coding_passes_for_segment,
                 // Will be set later.
                 data: &[],
             });
 
-            trace!("length({i}) {}", length);
+            trace!("length({segment}) {}", length);
+
+            Some(())
+        };
+
+        let mut last_segment = get_segment(previous_layers_passes);
+        let mut coding_passes_for_segment = 0;
+
+        for coding_pass in previous_layers_passes..cumulative_passes {
+            let segment = get_segment(coding_pass);
+
+            if segment != last_segment {
+                push_segment(last_segment, coding_passes_for_segment);
+                last_segment = segment;
+                coding_passes_for_segment = 1;
+            } else {
+                coding_passes_for_segment += 1;
+            }
+        }
+
+        // Flush the final segment if applicable.
+        if coding_passes_for_segment > 0 {
+            push_segment(last_segment, coding_passes_for_segment);
         }
 
         let end = storage.segments.len();
-
         layer.segments = Some(start..end);
+        code_block.number_of_coding_passes += added_coding_passes;
+        code_block.non_empty_layer_count += 1;
     }
 
     Some(())
+}
+
+fn segment_idx_for_bypass(code_block_idx: u32) -> u32 {
+    if code_block_idx < 10 {
+        0
+    } else {
+        1 + (2 * ((code_block_idx - 10) / 3))
+            + (if ((code_block_idx - 10) % 3) == 2 {
+                1
+            } else {
+                0
+            })
+    }
 }
 
 fn decode_bitplanes<'a>(
@@ -1066,6 +1113,9 @@ fn apply_mct(tile_ctx: &mut TileDecodeContext) {
 }
 
 fn store<'a>(tile: &'a Tile<'a>, header: &Header, tile_ctx: &mut TileDecodeContext<'a>) {
+    let width = header.size_data.tile_width;
+    let height = header.size_data.tile_height;
+
     for ((idwt_output, component_info), channel_data) in tile_ctx
         .idwt_outputs
         .iter_mut()
@@ -1093,26 +1143,28 @@ fn store<'a>(tile: &'a Tile<'a>, header: &Header, tile_ctx: &mut TileDecodeConte
             // decomposition level of the tile, which is usually not 1:1 aligned
             // with the actual tile rectangle. We also need to account for the
             // offset of the reference grid.
-            let skip_x = component_tile.rect.x0 - idwt_output.rect.x0;
-            let skip_y = component_tile.rect.y0 - idwt_output.rect.y0;
-            let take_x = component_tile.rect.width();
-            let take_y = component_tile.rect.height();
+            let (image_x_offset, image_y_offset) = (
+                header.size_data.image_area_x_offset,
+                header.size_data.image_area_y_offset,
+            );
+
+            let skip_x = image_x_offset.saturating_sub(idwt_output.rect.x0);
+            let skip_y = image_y_offset.saturating_sub(idwt_output.rect.y0);
 
             let input_row_iter = idwt_output
                 .coefficients
                 .chunks_exact(idwt_output.rect.width() as usize)
-                .skip(skip_y as usize)
-                .take(take_y as usize);
+                .skip(skip_y as usize);
 
             let output_row_iter = channel_data
                 .container
-                .chunks_exact_mut(header.size_data.reference_grid_width as usize)
-                .skip(tile.rect.y0 as usize)
-                .take(take_y as usize);
+                .chunks_exact_mut(header.size_data.image_width() as usize)
+                .skip(tile.rect.y0.saturating_sub(image_y_offset) as usize);
 
             for (input_row, output_row) in input_row_iter.zip(output_row_iter) {
-                let input_row = &input_row[skip_x as usize..][..take_x as usize];
-                let output_row = &mut output_row[tile.rect.x0 as usize..][..take_x as usize];
+                let input_row = &input_row[skip_x as usize..];
+                let output_row = &mut output_row
+                    [tile.rect.x0.saturating_sub(image_x_offset) as usize..][..input_row.len()];
 
                 output_row.copy_from_slice(input_row);
             }
@@ -1132,14 +1184,15 @@ fn store<'a>(tile: &'a Tile<'a>, header: &Header, tile_ctx: &mut TileDecodeConte
                     let sample = idwt_output.coefficients
                         [relative_y * component_tile.rect.width() as usize + relative_x];
 
-                    for x_offset in 0..scale_x as u32 {
-                        for y_offset in 0..scale_y as u32 {
-                            let y_position = (reference_grid_y + y_offset) as usize;
-                            let x_position = (reference_grid_x + x_offset) as usize;
+                    for x_position in
+                        reference_grid_x..u32::min(reference_grid_x + scale_x as u32, width)
+                    {
+                        for y_position in
+                            reference_grid_y..u32::min(reference_grid_y + scale_y as u32, height)
+                        {
+                            let pos = y_position as usize * width as usize + x_position as usize;
 
-                            channel_data.container[y_position
-                                * header.size_data.reference_grid_width as usize
-                                + x_position] = sample;
+                            channel_data.container[pos] = sample;
                         }
                     }
                 }
@@ -1149,15 +1202,15 @@ fn store<'a>(tile: &'a Tile<'a>, header: &Header, tile_ctx: &mut TileDecodeConte
 }
 
 pub(crate) trait BitReaderExt {
-    fn read_packet_header_bits(&mut self, bit_size: u8) -> Option<u32>;
+    fn read_bits_with_stuffing(&mut self, bit_size: u8) -> Option<u32>;
     fn read_stuff_bit_if_necessary(&mut self) -> Option<()>;
-    fn peak_packet_header_bits(&mut self, bit_size: u8) -> Option<u32>;
+    fn peak_bits_with_stuffing(&mut self, bit_size: u8) -> Option<u32>;
 }
 
 impl BitReaderExt for BitReader<'_> {
     // Like the normal `read_bits` method, but accounts for stuffing bits
     // in addition.
-    fn read_packet_header_bits(&mut self, bit_size: u8) -> Option<u32> {
+    fn read_bits_with_stuffing(&mut self, bit_size: u8) -> Option<u32> {
         let mut bit = 0;
 
         for _ in 0..bit_size {
@@ -1187,7 +1240,7 @@ impl BitReaderExt for BitReader<'_> {
         Some(())
     }
 
-    fn peak_packet_header_bits(&mut self, bit_size: u8) -> Option<u32> {
-        self.clone().read_packet_header_bits(bit_size)
+    fn peak_bits_with_stuffing(&mut self, bit_size: u8) -> Option<u32> {
+        self.clone().read_bits_with_stuffing(bit_size)
     }
 }

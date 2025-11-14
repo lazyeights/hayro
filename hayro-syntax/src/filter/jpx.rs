@@ -67,14 +67,16 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
         sycc_to_rgb(&mut buf, bit_depth);
     }
 
-    let buf = scale(buf.as_slice(), bpc, cs.num_components(), width, height)?;
+    let buf = scale(buf.as_slice(), bpc, cs.num_components(), width, height).unwrap();
 
     Some(FilterResult {
         data: buf,
         image_data: Some(ImageData {
             alpha,
-            color_space: cs,
+            color_space: Some(cs),
             bits_per_component: bpc,
+            width,
+            height,
         }),
     })
 }
@@ -86,13 +88,18 @@ fn scale(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    let mut input = vec![0; ((width + 1) * num_components as u32 * height) as usize];
+    let mut input = vec![
+        0;
+        (width as u64 * num_components as u64 * bit_per_component as u64).div_ceil(8)
+            as usize
+            * height as usize
+    ];
     let mut writer = BitWriter::new(&mut input, bit_per_component)?;
     let max = ((1 << bit_per_component) - 1) as f32;
 
     for bytes in data.chunks_exact(num_components as usize * width as usize) {
         for byte in bytes {
-            let scaled = byte.round().min(max) as u16;
+            let scaled = byte.round().min(max) as u32;
             writer.write(scaled)?;
         }
 

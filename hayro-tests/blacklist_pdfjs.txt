@@ -210,14 +210,10 @@ issue 12841
 issue8169
 issue15492
 
-# image has different resolution than indicated in dictionary
-issue9650
-
 # text should be bold but isnt
 issue9291
 
 # optional content groups
-issue269_1
 issue269_2
 
 # missing letters
@@ -259,8 +255,3 @@ issue6365
 issue4648
 # Another big JPX image, can probably be resized at decoding time.
 issue17289
-
-# unsupported JPX image
-issue13051
-issue11004
-issue19326

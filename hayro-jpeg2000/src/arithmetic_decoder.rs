@@ -261,7 +261,7 @@ static QE_TABLE: [QeData; 47] = qe!(
     0x0015, 43, 40, false,
     0x0009, 44, 41, false,
     0x0005, 45, 42, false,
-    0x0001, 46, 43, false,
+    0x0001, 45, 43, false,
     0x5601, 46, 46, false,
 );
 
@@ -295,7 +295,7 @@ mod tests {
 
         for _ in 0..expected_output.len() {
             for _ in 0..8 {
-                let next = decoder.decode(&mut ctx) as u16;
+                let next = decoder.decode(&mut ctx);
                 writer.write(next);
             }
         }

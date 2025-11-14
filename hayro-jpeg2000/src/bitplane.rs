@@ -11,7 +11,8 @@
 
 use crate::arithmetic_decoder::{ArithmeticDecoder, ArithmeticDecoderContext};
 use crate::codestream::CodeBlockStyle;
-use crate::decode::{CodeBlock, Layer, Segment, SubBandType};
+use crate::decode::{BitReaderExt, CodeBlock, Layer, Segment, SubBandType};
+use hayro_common::bit::BitReader;
 use log::warn;
 
 /// Decode the layers of the given code block into coefficients.
@@ -33,18 +34,16 @@ pub(crate) fn decode(
         return Ok(());
     }
 
-    if num_bitplanes > 32 {
+    if num_bitplanes as u32 > BITPLANE_BIT_SIZE {
         // If we want to adjust this, we need to change how `ComponentBits`
         // works.
-        return Err("bitplanes with more than 32 bits are not supported");
+        return Err("number of bitplanes is too high");
+    } else if 1 + (code_block.number_of_coding_passes - 1).div_ceil(3) > BITPLANE_BIT_SIZE {
+        return Err("code block has too many coding passes");
     }
 
     let mut layer_buffer = std::mem::take(&mut ctx.layer_buffer).unwrap_or_default();
     layer_buffer.clear();
-
-    if style.selective_arithmetic_coding_bypass {
-        return Err("unsupported code-block style features encountered during decoding");
-    }
 
     decode_inner(code_block, style, num_bitplanes, layers, all_segments, ctx)
         .ok_or("failed to decode code-block arithmetic data")?;
@@ -64,29 +63,100 @@ fn decode_inner(
 ) -> Option<()> {
     let mut combined_layers = vec![];
     let mut segment_ranges = vec![0];
+    let mut segment_coding_passes = vec![0];
+
+    let mut last_segment_idx = 0;
+    let mut coding_passes = 0;
 
     for layer in layers {
         if let Some(range) = layer.segments.clone() {
-            for segment in &all_segments[range.clone()] {
+            let layer_segments = &all_segments[range.clone()];
+            for segment in layer_segments {
+                if segment.idx != last_segment_idx {
+                    assert_eq!(segment.idx, last_segment_idx + 1);
+
+                    segment_ranges.push(combined_layers.len());
+                    segment_coding_passes.push(coding_passes);
+                    last_segment_idx += 1;
+                }
+
                 combined_layers.extend(segment.data);
-                segment_ranges.push(combined_layers.len());
+                coding_passes += segment.coding_pases;
             }
         }
     }
 
-    let mut decoder = if style.termination_on_each_pass {
-        ArithmeticDecoder::new(&combined_layers[..segment_ranges[1]])
+    assert_eq!(coding_passes, code_block.number_of_coding_passes);
+
+    segment_ranges.push(combined_layers.len());
+    segment_coding_passes.push(coding_passes);
+
+    let is_normal_mode =
+        !style.selective_arithmetic_coding_bypass && !style.termination_on_each_pass;
+
+    if is_normal_mode {
+        // Only one termination per code block, so we can just decode the
+        // whole range in one single pass.
+        let mut decoder = ArithmeticDecoder::new(&combined_layers);
+        handle_coding_passes(
+            0,
+            code_block.number_of_coding_passes,
+            style,
+            ctx,
+            &mut decoder,
+        )?;
     } else {
-        ArithmeticDecoder::new(&combined_layers)
-    };
+        // Otherwise, each segment introduces a termination. For selective
+        // arithmetic coding bypass, each segment only covers one coding pass
+        // and a termination is introduced every time. Otherwise, for only
+        // arithmetic coding bypass, terminations are introduced based on the
+        // exact index of the covered coding passes (see Table D.9).
+        for segment in 0..segment_coding_passes.len() - 1 {
+            let start_coding_pass = segment_coding_passes[segment];
+            let end_coding_pass = segment_coding_passes[segment + 1];
 
-    for coding_pass in 0..code_block.number_of_coding_passes {
-        if coding_pass > 0 && style.termination_on_each_pass {
-            let data = &combined_layers
-                [segment_ranges[coding_pass as usize]..segment_ranges[coding_pass as usize + 1]];
-            decoder = ArithmeticDecoder::new(data);
+            let data = &combined_layers[segment_ranges[segment]..segment_ranges[segment + 1]];
+
+            let use_arithmetic = if style.selective_arithmetic_coding_bypass {
+                if start_coding_pass <= 9 {
+                    true
+                } else {
+                    // Only for cleanup pass.
+                    start_coding_pass.is_multiple_of(3)
+                }
+            } else {
+                true
+            };
+
+            if use_arithmetic {
+                let mut decoder = ArithmeticDecoder::new(data);
+                handle_coding_passes(start_coding_pass, end_coding_pass, style, ctx, &mut decoder)?;
+            } else {
+                let mut decoder = BypassDecoder::new(data);
+                handle_coding_passes(start_coding_pass, end_coding_pass, style, ctx, &mut decoder)?;
+            }
         }
+    }
 
+    // Extend all coefficients with zero bits until we have the required number
+    // of bits.
+    for el in &mut ctx.magnitude_array {
+        while (el.count as u16) < num_bitplanes {
+            el.push_bit(0);
+        }
+    }
+
+    Some(())
+}
+
+fn handle_coding_passes(
+    start: u32,
+    end: u32,
+    style: &CodeBlockStyle,
+    ctx: &mut CodeBlockDecodeContext,
+    decoder: &mut impl BitDecoder,
+) -> Option<()> {
+    for coding_pass in start..end {
         enum PassType {
             Cleanup,
             SignificancePropagation,
@@ -104,7 +174,7 @@ fn decode_inner(
 
         match pass {
             PassType::Cleanup => {
-                cleanup_pass(ctx, &mut decoder);
+                cleanup_pass(ctx, decoder);
 
                 if style.segmentation_symbols {
                     let b0 = decoder.read_bit(ctx.arithmetic_decoder_context(18));
@@ -121,23 +191,15 @@ fn decode_inner(
                 ctx.reset_for_next_bitplane();
             }
             PassType::SignificancePropagation => {
-                significance_propagation_pass(ctx, &mut decoder);
+                significance_propagation_pass(ctx, decoder);
             }
             PassType::MagnitudeRefinement => {
-                magnitude_refinement_pass(ctx, &mut decoder);
+                magnitude_refinement_pass(ctx, decoder);
             }
         }
 
         if style.reset_context_probabilities {
             ctx.reset_contexts();
-        }
-    }
-
-    // Extend all coefficients with zero bits until we have the required number
-    // of bits.
-    for el in &mut ctx.magnitude_array {
-        while (el.count as u16) < num_bitplanes {
-            el.push_bit(0);
         }
     }
 
@@ -500,10 +562,10 @@ fn magnitude_refinement_pass(
 
 /// Decode a sign bit (Section D.3.2).
 #[inline(always)]
-fn decode_sign_bit(
+fn decode_sign_bit<T: BitDecoder>(
     pos: &Position,
     ctx: &mut CodeBlockDecodeContext,
-    decoder: &mut impl BitDecoder,
+    decoder: &mut T,
 ) {
     /// Based on Table D.2.
     #[inline(always)]
@@ -545,7 +607,11 @@ fn decode_sign_bit(
 
     let (ctx_label, xor_bit) = context_label_sign_coding(pos, ctx);
     let ad_ctx = ctx.arithmetic_decoder_context(ctx_label);
-    let sign_bit = decoder.read_bit(ad_ctx) ^ xor_bit as u32;
+    let sign_bit = if T::IS_BYPASS {
+        decoder.read_bit(ad_ctx)
+    } else {
+        decoder.read_bit(ad_ctx) ^ xor_bit as u32
+    };
     ctx.set_sign(pos, sign_bit as u8);
 }
 
@@ -627,9 +693,11 @@ pub(crate) struct ComponentBits {
     count: u8,
 }
 
+pub(crate) const BITPLANE_BIT_SIZE: u32 = size_of::<u32>() as u32 * 8;
+
 impl ComponentBits {
     fn push_bit(&mut self, bit: u32) {
-        assert!(self.count < 32);
+        assert!((self.count as u32) < BITPLANE_BIT_SIZE);
         assert!(bit < 2);
 
         self.inner = (self.inner << 1) | bit;
@@ -713,12 +781,35 @@ impl Iterator for PositionIterator {
 
 // We use a trait so that we can mock the arithmetic decoder for tests.
 trait BitDecoder {
+    const IS_BYPASS: bool;
+
     fn read_bit(&mut self, context: &mut ArithmeticDecoderContext) -> u32;
 }
 
 impl BitDecoder for ArithmeticDecoder<'_> {
+    const IS_BYPASS: bool = false;
+
     fn read_bit(&mut self, context: &mut ArithmeticDecoderContext) -> u32 {
         Self::read_bit(self, context)
+    }
+}
+
+struct BypassDecoder<'a>(BitReader<'a>);
+
+impl<'a> BypassDecoder<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self(BitReader::new(data))
+    }
+}
+
+impl BitDecoder for BypassDecoder<'_> {
+    const IS_BYPASS: bool = true;
+
+    fn read_bit(&mut self, _: &mut ArithmeticDecoderContext) -> u32 {
+        self.0.read_bits_with_stuffing(1).unwrap_or_else(|| {
+            warn!("exceeded buffer in by-pass decoder");
+            1
+        })
     }
 }
 
@@ -799,6 +890,7 @@ mod tests {
             missing_bit_planes: 0,
             number_of_coding_passes: 16,
             l_block: 0,
+            non_empty_layer_count: 1,
         };
 
         let mut ctx = CodeBlockDecodeContext::default();
@@ -813,7 +905,9 @@ mod tests {
                 segments: Some(0..1),
             }],
             &[Segment {
-                length: data.len() as u32,
+                idx: 0,
+                coding_pases: 16,
+                data_length: data.len() as u32,
                 data: &data,
             }],
         )
@@ -838,6 +932,7 @@ mod tests {
             missing_bit_planes: 0,
             number_of_coding_passes: 7,
             l_block: 0,
+            non_empty_layer_count: 1,
         };
 
         let mut ctx = CodeBlockDecodeContext::default();
@@ -852,7 +947,9 @@ mod tests {
                 segments: Some(0..1),
             }],
             &[Segment {
-                length: data.len() as u32,
+                idx: 0,
+                coding_pases: 7,
+                data_length: data.len() as u32,
                 data: &data,
             }],
         )
@@ -893,6 +990,7 @@ mod tests {
             missing_bit_planes: 5,
             number_of_coding_passes: 13,
             l_block: 0,
+            non_empty_layer_count: 1,
         };
 
         let mut ctx = CodeBlockDecodeContext::default();
@@ -907,7 +1005,9 @@ mod tests {
                 segments: Some(0..1),
             }],
             &[Segment {
-                length: data.len() as u32,
+                idx: 0,
+                coding_pases: 13,
+                data_length: data.len() as u32,
                 data: &data,
             }],
         )

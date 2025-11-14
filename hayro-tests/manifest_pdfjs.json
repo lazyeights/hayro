@@ -1122,5 +1122,10 @@
   "simpletype3font",
   "standard_fonts_no_system_fonts",
   "type4psfunc",
-  "zerowidthline"
+  "zerowidthline",
+  "issue13051",
+  "issue269_1",
+  "issue19326",
+  "issue11004",
+  "issue9650"
 ]
