@@ -4,6 +4,10 @@ use hayro_interpret::{
     PathDrawMode, SoftMask, interpret_page,
 };
 use hayro_syntax::Pdf;
+use hayro_syntax::object::dict::keys::{BASE_ENCODING, FONT_NAME, TYPE};
+use hayro_syntax::object::{Name, Object};
+
+use log::info;
 
 use std::fmt::Write;
 
@@ -12,9 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
-    // colog::default_builder()
-    //     .filter_level(log::LevelFilter::Debug)
-    //     .init();
+    colog::default_builder()
+        .filter_level(log::LevelFilter::Debug)
+        .init();
 
     let args: Vec<String> = std::env::args().collect();
     let relative_path = args
@@ -38,29 +42,15 @@ fn main() {
     let page = &pdf.pages()[0];
 
     let mut extractor = TextExtractor::default();
-    extractor.dimensions = page.render_dimensions();
-
-    writeln!(extractor.text, "<meta charset='utf-8' /> ").unwrap();
-    writeln!(extractor.text, "<!-- page {} -->", 0).unwrap();
-    writeln!(
-        extractor.text,
-        "<div id='page{}' style='position: relative; width: {}px; height: {}px; border: 1px black solid'>",
-        0,
-        extractor.dimensions.0,
-        extractor.dimensions.1
-    ).unwrap();
 
     interpret_page(page, &mut context, &mut extractor);
 
-    writeln!(extractor.text, "</div>").unwrap();
-
-    print!("{}", extractor.text);
+    println!("{}", extractor.text);
 }
 
 #[derive(Default)]
 struct TextExtractor {
     text: String,
-    dimensions: (f32, f32),
 }
 
 /// Implement `Device` for `TextExtractor`. We extract Unicode text from glyphs.
@@ -76,26 +66,13 @@ impl Device<'_> for TextExtractor {
     fn draw_glyph(
         &mut self,
         glyph: &Glyph<'_>,
-        transform: Affine,
-        glyph_transform: Affine,
+        _: Affine,
+        _: Affine,
         _: &Paint<'_>,
         _: &GlyphDrawMode,
     ) {
         if let Some(unicode_char) = glyph.as_unicode() {
-            // Apply vertical flip transformation to combined transform
-            // to place origin at top-left corner
-            let flip_transform = Affine::translate((0.0, self.dimensions.1 as f64))
-                * Affine::scale_non_uniform(1.0, -1.0);
-            let transform = flip_transform * transform * glyph_transform;
-
-            let point = Point::new(0.0, 0.0);
-            let position = transform * point;
-
-            writeln!(
-                self.text,
-                "<div style='position: absolute; color: black; left: {}px; top: {}px; font-size: {}pt'>{}</div>",
-                position.x, position.y, 6, unicode_char
-            ).unwrap();
+            write!(self.text, "{}", unicode_char).unwrap();
         } else {
             // Fallback for glyphs without Unicode mapping
             self.text.push('�'); // Replacement character

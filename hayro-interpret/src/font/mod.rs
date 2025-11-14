@@ -157,8 +157,8 @@ impl<'a> Type3Glyph<'a> {
     /// Returns the Unicode code point for this glyph, if available.
     ///
     /// Note: Type3 fonts can only provide Unicode via ToUnicode CMap.
-    /// See [`Glyph::as_unicode`] for details.
     pub fn as_unicode(&self) -> Option<char> {
+        warn!("Type3::as_unicode {}", self.char_code);
         self.font.char_code_to_unicode(self.char_code)
     }
 }

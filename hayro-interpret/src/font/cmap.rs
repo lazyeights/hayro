@@ -81,7 +81,7 @@ impl CMap {
         Some(())
     }
 
-    fn map_bf_range(&mut self, low: u32, high: u32, dst_low: String) -> Option<()> {
+    fn map_bf_range(&mut self, low: u32, high: u32, dst_low: u32) -> Option<()> {
         if high - low > MAX_MAP_RANGE {
             return None;
         }
@@ -90,21 +90,8 @@ impl CMap {
         let mut current_dst = dst_low;
 
         while current_low <= high {
-            self.map.insert(current_low, bf_string_char(&current_dst));
-
-            let mut bytes = current_dst.into_bytes();
-            if let Some(last_byte) = bytes.last_mut() {
-                if *last_byte == 0xff {
-                    if bytes.len() > 1 {
-                        let len = bytes.len();
-                        bytes[len - 2] += 1;
-                        bytes[len - 1] = 0x00;
-                    }
-                } else {
-                    *last_byte += 1;
-                }
-            }
-            current_dst = String::from_utf8_lossy(&bytes).to_string();
+            self.map.insert(current_low, current_dst);
+            current_dst += 1;
             current_low += 1;
         }
 
@@ -452,13 +439,24 @@ fn parse_bf_range(cmap: &mut CMap, lexer: &mut CMapLexer) -> Option<()> {
 
                 let dst_obj = lexer.get_obj();
                 match dst_obj {
-                    Token::Integer(dst_int) => {
-                        let dst_low = char::from(dst_int as u8).to_string();
-                        cmap.map_bf_range(low, high, dst_low)?;
+                    Token::Integer(dst_low) => {
+                        cmap.map_bf_range(low, high, dst_low as u32)?;
                     }
                     ref token => {
                         if let Some(dst_str) = expect_string(token) {
-                            cmap.map_bf_range(low, high, dst_str)?;
+                            // For beginbfrange, if the destination is a short hex string (like <0003>),
+                            // it represents a Unicode code point, not a multi-byte string
+                            if dst_str.chars().count() <= 2 {
+                                // Convert to Unicode code point
+                                let code_point = str_to_int(&dst_str);
+                                if let Some(unicode_char) = char::from_u32(code_point) {
+                                    cmap.map_bf_range(low, high, unicode_char as u32)?;
+                                } else {
+                                    cmap.map_bf_range(low, high, bf_string_char(&dst_str))?;
+                                }
+                            } else {
+                                cmap.map_bf_range(low, high, bf_string_char(&dst_str))?;
+                            }
                         } else if let Token::Command(cmd) = token {
                             if cmd == "[" {
                                 let mut array = Vec::new();

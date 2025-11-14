@@ -145,25 +145,19 @@ impl Type0Font {
         }
     }
 
-    pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
+    pub(crate) fn char_code_to_unicode(&self, code: u32) -> Option<char> {
         // 1. Try ToUnicode CMap (highest priority)
         if let Some(to_unicode) = &self.to_unicode {
-            if let Some(unicode) = to_unicode.lookup_code(char_code) {
+            if let Some(unicode) = to_unicode.lookup_code(code) {
                 return char::from_u32(unicode);
             }
         }
 
-        // 2. For Identity-H/Identity-V, the CID often equals Unicode
-        // This is a common pattern for Unicode CMaps
-        if self.encoding.is_identity_cmap() {
-            if let Some(cid) = self.code_to_cid(char_code) {
-                // Try treating CID as Unicode code point
-                if let Some(c) = char::from_u32(cid) {
-                    return Some(c);
-                }
-            }
-        }
-
+        warn!(
+            "Type0Font::char_code_to_unicode: No unicode mapping for 0x{} {:?}",
+            code,
+            self.encoding.lookup_code(code)
+        );
         // TODO: Implement CID collection mappings (Adobe-Japan1, Adobe-GB1, etc.)
         // For now, we don't have built-in CID collection mappings
 
