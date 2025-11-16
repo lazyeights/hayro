@@ -234,8 +234,7 @@ impl StandardKind {
     }
 
     fn char_code_to_unicode(&self, code: u8) -> Option<char> {
-        self.code_to_ps_name(code as u8)
-            .and_then(glyph_name_to_unicode)
+        self.code_to_ps_name(code).and_then(glyph_name_to_unicode)
     }
 }
 

@@ -90,10 +90,10 @@ impl<'a> Type3<'a> {
 
     pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
         // Type3 fonts can only provide Unicode via ToUnicode CMap.
-        if let Some(to_unicode) = &self.to_unicode {
-            if let Some(unicode) = to_unicode.lookup_code(char_code) {
-                return char::from_u32(unicode);
-            }
+        if let Some(to_unicode) = &self.to_unicode
+            && let Some(unicode) = to_unicode.lookup_code(char_code)
+        {
+            return char::from_u32(unicode);
         }
 
         None
