@@ -40,8 +40,10 @@ fn main() {
     // Run everything!
     let page = &pdf.pages()[0];
 
-    let mut extractor = TextExtractor::default();
-    extractor.dimensions = page.render_dimensions();
+    let mut extractor = TextExtractor {
+        dimensions: page.render_dimensions(),
+        ..Default::default()
+    };
 
     writeln!(extractor.text, "<meta charset='utf-8' /> ").unwrap();
     writeln!(extractor.text, "<!-- page {} -->", 0).unwrap();
