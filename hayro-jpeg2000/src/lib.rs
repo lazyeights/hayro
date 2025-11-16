@@ -309,6 +309,10 @@ fn read_jp2_file(data: &[u8]) -> Result<Bitmap, &'static str> {
                 }
             }
 
+            if image_metadata.width == 0 || image_metadata.height == 0 {
+                return Err("image has invalid dimensions");
+            }
+
             metadata = Ok(image_metadata);
         } else if current_box.box_type == CONTIGUOUS_CODESTREAM {
             channels = Ok(codestream::read(current_box.data)?);
@@ -317,8 +321,13 @@ fn read_jp2_file(data: &[u8]) -> Result<Bitmap, &'static str> {
         }
     }
 
-    let (_, mut channels) = channels?;
-    let metadata = metadata?;
+    let (header, mut channels) = channels?;
+    let mut metadata = metadata?;
+
+    // In case header and codestream have inconsistent size metadata, use the
+    // one from the codestream.
+    metadata.width = header.size_data.image_width();
+    metadata.height = header.size_data.image_height();
 
     for (idx, channel) in channels.iter_mut().enumerate() {
         channel.is_alpha = metadata
