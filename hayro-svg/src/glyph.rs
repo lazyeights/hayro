@@ -27,6 +27,10 @@ impl<'a> SvgRenderer<'a> {
         paint: &Paint<'a>,
         mode: &GlyphDrawMode,
     ) {
+        if matches!(mode, GlyphDrawMode::Invisible) {
+            return;
+        }
+        
         match glyph {
             Glyph::Outline(o) => {
                 // TODO: Figure out how to better merge transform and glyph transform
@@ -52,8 +56,8 @@ impl<'a> SvgRenderer<'a> {
                         self.write_paint(paint, &outline, transform, true);
                     }
                     GlyphDrawMode::Invisible => {
-                        // Don't render invisible text in SVG output
-                        return;
+                        // We exited above.
+                        unreachable!()
                     }
                 }
                 self.xml.end_element();
