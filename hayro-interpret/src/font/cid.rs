@@ -146,20 +146,13 @@ impl Type0Font {
     }
 
     pub(crate) fn char_code_to_unicode(&self, code: u32) -> Option<char> {
-        // 1. Try ToUnicode CMap (highest priority)
-        if let Some(to_unicode) = &self.to_unicode {
-            if let Some(unicode) = to_unicode.lookup_code(code) {
-                return char::from_u32(unicode);
-            }
+        if let Some(to_unicode) = &self.to_unicode
+            && let Some(unicode) = to_unicode.lookup_code(code)
+        {
+            return char::from_u32(unicode);
         }
 
-        warn!(
-            "Type0Font::char_code_to_unicode: No unicode mapping for 0x{} {:?}",
-            code,
-            self.encoding.lookup_code(code)
-        );
-        // TODO: Implement CID collection mappings (Adobe-Japan1, Adobe-GB1, etc.)
-        // For now, we don't have built-in CID collection mappings
+        // TODO: Implement CID collection mappings (Adobe-Japan1, Adobe-GB1, etc.).
 
         None
     }

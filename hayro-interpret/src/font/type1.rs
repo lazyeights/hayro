@@ -23,7 +23,6 @@ impl Type1Font {
     pub(crate) fn new(dict: &Dict, resolver: &FontResolverFn) -> Option<Self> {
         let cache_key = dict.cache_key();
 
-        // Parse ToUnicode CMap if present
         let to_unicode = dict
             .get::<Stream>(TO_UNICODE)
             .and_then(|s| s.decoded().ok())
@@ -103,18 +102,17 @@ impl Type1Font {
     }
 
     pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<char> {
-        // 1. Try ToUnicode CMap (highest priority)
-        if let Some(to_unicode) = &self.2 {
-            if let Some(unicode) = to_unicode.lookup_code(char_code) {
-                // Skip null character mappings and fall back to glyph name lookup
-                // Some PDFs have incorrect ToUnicode mappings that map to U+0000
-                if unicode != 0 {
-                    return char::from_u32(unicode);
-                }
+        if let Some(to_unicode) = &self.2
+            && let Some(unicode) = to_unicode.lookup_code(char_code)
+        {
+            // Skip null character mappings and fall back to glyph name
+            // lookup. Some PDFs have incorrect ToUnicode mappings that map
+            // to U+0000.
+            if unicode != 0 {
+                return char::from_u32(unicode);
             }
         }
 
-        // 2. Try glyph name → Unicode (via encoding)
         let code = char_code as u8;
         match &self.1 {
             Kind::Standard(s) => s.char_code_to_unicode(code),
@@ -236,7 +234,6 @@ impl StandardKind {
     }
 
     fn char_code_to_unicode(&self, code: u8) -> Option<char> {
-        // Try glyph name → Unicode (via encoding)
         self.code_to_ps_name(code as u8)
             .and_then(glyph_name_to_unicode)
     }
@@ -317,7 +314,6 @@ impl Type1Kind {
     }
 
     fn char_code_to_unicode(&self, code: u8) -> Option<char> {
-        // Get the glyph name from encoding
         let glyph_name = if let Some(entry) = self.encodings.get(&code) {
             Some(entry.as_str())
         } else {
@@ -327,7 +323,6 @@ impl Type1Kind {
             }
         };
 
-        // 2. Try glyph name → Unicode (via encoding)
         glyph_name.and_then(glyph_name_to_unicode)
     }
 }
@@ -386,7 +381,6 @@ impl CffKind {
     }
 
     fn char_code_to_unicode(&self, code: u8) -> Option<char> {
-        // Get the glyph name from encoding
         let glyph_name = if let Some(entry) = self.encodings.get(&code) {
             Some(entry.as_str())
         } else {
@@ -397,7 +391,6 @@ impl CffKind {
             }
         };
 
-        // Try glyph name → Unicode
         glyph_name.and_then(glyph_name_to_unicode)
     }
 }

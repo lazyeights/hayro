@@ -68,12 +68,12 @@ impl Glyph<'_> {
     ///
     /// **For CID Fonts (Type0):**
     /// 1. ToUnicode CMap (if present)
-    /// 2. Identity CMap heuristic (treats CID as Unicode code point)
+    ///
     ///
     /// **For Type3 Fonts:**
-    /// 1. ToUnicode CMap (if present) - only option
+    /// 1. ToUnicode CMap (if present)
     ///
-    /// Returns `None` if the Unicode value cannot be determined.
+    /// Returns `None` if the Unicode value could not be determined.
     pub fn as_unicode(&self) -> Option<char> {
         match self {
             Glyph::Outline(g) => g.as_unicode(),
@@ -160,7 +160,6 @@ impl<'a> Type3Glyph<'a> {
     ///
     /// Note: Type3 fonts can only provide Unicode via ToUnicode CMap.
     pub fn as_unicode(&self) -> Option<char> {
-        warn!("Type3::as_unicode {}", self.char_code);
         self.font.char_code_to_unicode(self.char_code)
     }
 }
@@ -562,8 +561,7 @@ pub(crate) fn glyph_name_to_unicode(name: &str) -> Option<char> {
 
     let convert = |input: &str| u32::from_str_radix(input, 16).ok().and_then(char::from_u32);
 
-    return name
-        .starts_with("uni")
+    name.starts_with("uni")
         .then(|| name.get(3..).and_then(convert))
         .or_else(|| {
             name.starts_with("u")
@@ -572,6 +570,7 @@ pub(crate) fn glyph_name_to_unicode(name: &str) -> Option<char> {
         .flatten()
         .or_else(|| {
             warn!("failed to map glyph name {} to unicode", name);
+
             None
-        });
+        })
 }

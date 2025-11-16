@@ -445,7 +445,7 @@ fn parse_bf_range(cmap: &mut CMap, lexer: &mut CMapLexer) -> Option<()> {
                     ref token => {
                         if let Some(dst_str) = expect_string(token) {
                             // For beginbfrange, if the destination is a short hex string (like <0003>),
-                            // it represents a Unicode code point, not a multi-byte string
+                            // it represents a Unicode code point, not a multi-byte string.
                             if dst_str.chars().count() <= 2 {
                                 // Convert to Unicode code point
                                 let code_point = str_to_int(&dst_str);

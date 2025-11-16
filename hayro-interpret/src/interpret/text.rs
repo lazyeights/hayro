@@ -97,8 +97,8 @@ pub(crate) fn show_glyph<'a>(
             );
         }
         TextRenderingMode::Invisible => {
-            // Still call draw_glyph for invisible text - devices like text extractors
-            // need to process invisible glyphs for text extraction
+            // Still call draw_glyph for invisible text, so that it can
+            // for example be used for text extraction.
             device.draw_glyph(
                 glyph,
                 ctx.get().ctm,

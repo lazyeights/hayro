@@ -68,7 +68,6 @@ impl TrueTypeFont {
             .ok()
             .and_then(|cff| CffFontBlob::new(Arc::new(cff.offset_data().as_ref().to_vec())));
 
-        // Parse ToUnicode CMap if present
         let to_unicode = dict
             .get::<Stream>(TO_UNICODE)
             .and_then(|s| s.decoded().ok())
@@ -232,16 +231,14 @@ impl TrueTypeFont {
     }
 
     pub(crate) fn char_code_to_unicode(&self, code: u32) -> Option<char> {
-        // 1. Try ToUnicode CMap (highest priority)
-        if let Some(to_unicode) = &self.to_unicode {
-            if let Some(unicode) = to_unicode.lookup_code(code) {
-                return char::from_u32(unicode);
-            }
+        if let Some(to_unicode) = &self.to_unicode
+            && let Some(unicode) = to_unicode.lookup_code(code)
+        {
+            char::from_u32(unicode)
+        } else {
+            self.code_to_name(code as u8)
+                .and_then(glyph_name_to_unicode)
         }
-
-        // 2. Try glyph name → Unicode (via encoding)
-        self.code_to_name(code as u8)
-            .and_then(glyph_name_to_unicode)
 
         // TODO: The test PDFs below fail (but mutool can render them correctly).
         // There is likely some other strategy that requires processing the font tables
