@@ -101,7 +101,7 @@ impl Device<'_> for TextExtractor {
             ).unwrap();
         } else {
             // Fallback for glyphs without Unicode mapping.
-            self.text.push('�'); 
+            self.text.push('�');
         }
     }
 

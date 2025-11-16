@@ -30,7 +30,7 @@ impl<'a> SvgRenderer<'a> {
         if matches!(mode, GlyphDrawMode::Invisible) {
             return;
         }
-        
+
         match glyph {
             Glyph::Outline(o) => {
                 // TODO: Figure out how to better merge transform and glyph transform
