@@ -1,3 +1,10 @@
+//! A small example that shows how you can extract unicode characters from
+//! glyphs. Please note that Unicode extraction is still experimental, so it
+//! might not work fully correctly in certain cases. Note also that generating
+//! div elements for every single character is clearly not desirable and there
+//! should be some word/sentence merging algorithm in-place, but this is
+//! out-of-scope for this example.
+
 use hayro_interpret::font::Glyph;
 use hayro_interpret::{
     BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterSettings, Paint,
@@ -79,7 +86,7 @@ impl Device<'_> for TextExtractor {
     ) {
         if let Some(unicode_char) = glyph.as_unicode() {
             // Apply vertical flip transformation to combined transform
-            // to place origin at top-left corner
+            // to place origin at top-left corner.
             let flip_transform = Affine::translate((0.0, self.dimensions.1 as f64))
                 * Affine::scale_non_uniform(1.0, -1.0);
             let transform = flip_transform * transform * glyph_transform;
@@ -93,8 +100,8 @@ impl Device<'_> for TextExtractor {
                 position.x, position.y, 6, unicode_char
             ).unwrap();
         } else {
-            // Fallback for glyphs without Unicode mapping
-            self.text.push('�'); // Replacement character
+            // Fallback for glyphs without Unicode mapping.
+            self.text.push('�'); 
         }
     }
 
