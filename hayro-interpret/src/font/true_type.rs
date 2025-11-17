@@ -2,7 +2,7 @@ use crate::CacheKey;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::generated::{glyph_names, mac_os_roman, mac_roman};
-use crate::font::{Encoding, FontFlags, glyph_name_to_unicode, read_to_unicode};
+use crate::font::{Encoding, FontFlags, glyph_name_to_unicode, read_to_unicode, unicode_from_name};
 use crate::util::{CodeMapExt, OptionLog};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -130,27 +130,10 @@ impl TrueTypeFont {
                         && record.encoding_id() == 1
                         && let Ok(subtable) = record.subtable(cmap.offset_data())
                     {
-                        let convert = |input: &str| {
-                            u32::from_str_radix(input, 16)
-                                .ok()
-                                .and_then(char::from_u32)
-                                .map(|s| s.to_string())
-                        };
-
                         glyph = glyph.or_else(|| {
                             glyph_names::get(lookup)
                                 .map(|n| n.to_string())
-                                .or_else(|| {
-                                    lookup
-                                        .starts_with("uni")
-                                        .then(|| lookup.get(3..).and_then(convert))
-                                        .or_else(|| {
-                                            lookup
-                                                .starts_with("u")
-                                                .then(|| lookup.get(1..).and_then(convert))
-                                        })
-                                        .flatten()
-                                })
+                                .or_else(|| unicode_from_name(lookup).map(|n| n.to_string()))
                                 .and_then(|n| n.chars().next())
                                 .and_then(|c| subtable.map_codepoint(c))
                                 .filter(|g| *g != GlyphId::NOTDEF)

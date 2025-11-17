@@ -560,6 +560,14 @@ pub(crate) fn glyph_name_to_unicode(name: &str) -> Option<char> {
         return unicode_str.chars().next();
     }
 
+    unicode_from_name(name).or_else(|| {
+        warn!("failed to map glyph name {} to unicode", name);
+
+        None
+    })
+}
+
+pub(crate) fn unicode_from_name(name: &str) -> Option<char> {
     let convert = |input: &str| u32::from_str_radix(input, 16).ok().and_then(char::from_u32);
 
     name.starts_with("uni")
@@ -569,11 +577,6 @@ pub(crate) fn glyph_name_to_unicode(name: &str) -> Option<char> {
                 .then(|| name.get(1..).and_then(convert))
         })
         .flatten()
-        .or_else(|| {
-            warn!("failed to map glyph name {} to unicode", name);
-
-            None
-        })
 }
 
 pub(crate) fn read_to_unicode(dict: &Dict) -> Option<CMap> {
