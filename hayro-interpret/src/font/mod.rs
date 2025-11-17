@@ -63,18 +63,21 @@ impl Glyph<'_> {
     /// represents. The exact fallback chain depends on the font type:
     ///
     /// **For Outline Fonts (Type1, TrueType, CFF):**
-    /// 1. ToUnicode CMap (if present)
+    /// 1. ToUnicode CMap
     /// 2. Glyph name → Unicode (via Adobe Glyph List)
     /// 3. Unicode naming conventions (e.g., "uni0041", "u0041")
     ///
     /// **For CID Fonts (Type0):**
-    /// 1. ToUnicode CMap (if present)
+    /// 1. ToUnicode CMap
     ///
     ///
     /// **For Type3 Fonts:**
-    /// 1. ToUnicode CMap (if present)
+    /// 1. ToUnicode CMap
     ///
     /// Returns `None` if the Unicode value could not be determined.
+    ///
+    /// Please note that this method is still somewhat experimental and might
+    /// not work reliably in all cases.
     pub fn as_unicode(&self) -> Option<char> {
         match self {
             Glyph::Outline(g) => g.as_unicode(),

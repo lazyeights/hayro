@@ -447,7 +447,6 @@ fn parse_bf_range(cmap: &mut CMap, lexer: &mut CMapLexer) -> Option<()> {
                             // For beginbfrange, if the destination is a short hex string (like <0003>),
                             // it represents a Unicode code point, not a multi-byte string.
                             if dst_str.chars().count() <= 2 {
-                                // Convert to Unicode code point
                                 let code_point = str_to_int(&dst_str);
                                 if let Some(unicode_char) = char::from_u32(code_point) {
                                     cmap.map_bf_range(low, high, unicode_char as u32)?;
