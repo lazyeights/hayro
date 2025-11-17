@@ -1,6 +1,7 @@
 use crate::CacheKey;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::cmap::{CMap, parse_cmap};
+use crate::font::read_to_unicode;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::Stream;
@@ -55,13 +56,7 @@ impl Type0Font {
         let cid_to_gid_map = CidToGIdMap::new(&descendant_font).unwrap_or_default();
         let cache_key = dict.cache_key();
 
-        let to_unicode = dict
-            .get::<Stream>(TO_UNICODE)
-            .and_then(|s| s.decoded().ok())
-            .and_then(|data| {
-                let cmap_str = std::str::from_utf8(&data).ok()?;
-                parse_cmap(cmap_str)
-            });
+        let to_unicode = read_to_unicode(&dict);
 
         Some(Self {
             cache_key,

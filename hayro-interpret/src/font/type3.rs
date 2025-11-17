@@ -3,7 +3,7 @@ use crate::device::Device;
 use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::true_type::{read_encoding, read_widths};
-use crate::font::{Encoding, Glyph, Type3Glyph, UNITS_PER_EM};
+use crate::font::{Encoding, Glyph, Type3Glyph, UNITS_PER_EM, read_to_unicode};
 use crate::interpret::state::TextState;
 use crate::soft_mask::SoftMask;
 use crate::{BlendMode, interpret};
@@ -54,13 +54,7 @@ impl<'a> Type3<'a> {
             procs
         };
 
-        let to_unicode = dict
-            .get::<Stream>(TO_UNICODE)
-            .and_then(|s| s.decoded().ok())
-            .and_then(|data| {
-                let cmap_str = std::str::from_utf8(&data).ok()?;
-                parse_cmap(cmap_str)
-            });
+        let to_unicode = read_to_unicode(&dict);
 
         Self {
             glyph_simulator: GlyphSimulator::new(),

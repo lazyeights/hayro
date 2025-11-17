@@ -13,10 +13,10 @@ use crate::font::type3::Type3;
 use crate::interpret::state::State;
 use crate::{CacheKey, FontResolverFn, InterpreterSettings, Paint};
 use bitflags::bitflags;
-use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
 use hayro_syntax::object::dict::keys::SUBTYPE;
 use hayro_syntax::object::dict::keys::*;
+use hayro_syntax::object::{Dict, Stream};
 use hayro_syntax::page::Resources;
 use hayro_syntax::xref::XRef;
 use kurbo::{Affine, BezPath, Vec2};
@@ -44,6 +44,7 @@ pub(crate) const UNITS_PER_EM: f32 = 1000.0;
 /// A container for the bytes of a PDF file.
 pub type FontData = Arc<dyn AsRef<[u8]> + Send + Sync>;
 
+use crate::font::cmap::{CMap, parse_cmap};
 use crate::util::hash128;
 pub use standard_font::StandardFont;
 
@@ -572,5 +573,14 @@ pub(crate) fn glyph_name_to_unicode(name: &str) -> Option<char> {
             warn!("failed to map glyph name {} to unicode", name);
 
             None
+        })
+}
+
+pub(crate) fn read_to_unicode(dict: &Dict) -> Option<CMap> {
+    dict.get::<Stream>(TO_UNICODE)
+        .and_then(|s| s.decoded().ok())
+        .and_then(|data| {
+            let cmap_str = std::str::from_utf8(&data).ok()?;
+            parse_cmap(cmap_str)
         })
 }

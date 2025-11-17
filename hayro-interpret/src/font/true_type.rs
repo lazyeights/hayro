@@ -2,7 +2,7 @@ use crate::CacheKey;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
 use crate::font::cmap::{CMap, parse_cmap};
 use crate::font::generated::{glyph_names, mac_os_roman, mac_roman};
-use crate::font::{Encoding, FontFlags, glyph_name_to_unicode};
+use crate::font::{Encoding, FontFlags, glyph_name_to_unicode, read_to_unicode};
 use crate::util::{CodeMapExt, OptionLog};
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -68,13 +68,7 @@ impl TrueTypeFont {
             .ok()
             .and_then(|cff| CffFontBlob::new(Arc::new(cff.offset_data().as_ref().to_vec())));
 
-        let to_unicode = dict
-            .get::<Stream>(TO_UNICODE)
-            .and_then(|s| s.decoded().ok())
-            .and_then(|data| {
-                let cmap_str = std::str::from_utf8(&data).ok()?;
-                parse_cmap(cmap_str)
-            });
+        let to_unicode = read_to_unicode(&dict);
 
         Some(Self {
             base_font,
