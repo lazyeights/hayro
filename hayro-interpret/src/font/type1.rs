@@ -23,7 +23,7 @@ impl Type1Font {
     pub(crate) fn new(dict: &Dict, resolver: &FontResolverFn) -> Option<Self> {
         let cache_key = dict.cache_key();
 
-        let to_unicode = read_to_unicode(&dict);
+        let to_unicode = read_to_unicode(dict);
 
         let fallback = || {
             // TODO: Actually use fallback fonts

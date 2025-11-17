@@ -56,7 +56,7 @@ impl Type0Font {
         let cid_to_gid_map = CidToGIdMap::new(&descendant_font).unwrap_or_default();
         let cache_key = dict.cache_key();
 
-        let to_unicode = read_to_unicode(&dict);
+        let to_unicode = read_to_unicode(dict);
 
         Some(Self {
             cache_key,

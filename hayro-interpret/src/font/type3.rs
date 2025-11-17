@@ -54,7 +54,7 @@ impl<'a> Type3<'a> {
             procs
         };
 
-        let to_unicode = read_to_unicode(&dict);
+        let to_unicode = read_to_unicode(dict);
 
         Self {
             glyph_simulator: GlyphSimulator::new(),

@@ -68,7 +68,7 @@ impl TrueTypeFont {
             .ok()
             .and_then(|cff| CffFontBlob::new(Arc::new(cff.offset_data().as_ref().to_vec())));
 
-        let to_unicode = read_to_unicode(&dict);
+        let to_unicode = read_to_unicode(dict);
 
         Some(Self {
             base_font,
