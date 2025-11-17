@@ -1,6 +1,6 @@
 use crate::CacheKey;
 use crate::font::blob::{CffFontBlob, OpenTypeFontBlob};
-use crate::font::cmap::{CMap, parse_cmap};
+use crate::font::cmap::CMap;
 use crate::font::generated::{glyph_names, mac_os_roman, mac_roman};
 use crate::font::{Encoding, FontFlags, glyph_name_to_unicode, read_to_unicode, unicode_from_name};
 use crate::util::{CodeMapExt, OptionLog};

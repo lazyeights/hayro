@@ -1,6 +1,6 @@
 use crate::context::Context;
 use crate::device::Device;
-use crate::font::cmap::{CMap, parse_cmap};
+use crate::font::cmap::CMap;
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::true_type::{read_encoding, read_widths};
 use crate::font::{Encoding, Glyph, Type3Glyph, UNITS_PER_EM, read_to_unicode};
@@ -13,7 +13,7 @@ use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_MATRIX, RESOURCES, TO_UNICODE};
+use hayro_syntax::object::dict::keys::{CHAR_PROCS, FONT_MATRIX, RESOURCES};
 use hayro_syntax::page::Resources;
 use kurbo::{Affine, BezPath, Rect};
 use skrifa::GlyphId;

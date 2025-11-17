@@ -1,5 +1,5 @@
 use crate::font::blob::{CffFontBlob, Type1FontBlob};
-use crate::font::cmap::{CMap, parse_cmap};
+use crate::font::cmap::CMap;
 use crate::font::generated::glyph_names;
 use crate::font::glyph_simulator::GlyphSimulator;
 use crate::font::standard_font::{StandardFont, StandardFontBlob, select_standard_font};
@@ -8,7 +8,7 @@ use crate::font::{Encoding, FallbackFontQuery, FontQuery, glyph_name_to_unicode,
 use crate::{CacheKey, FontResolverFn};
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Stream;
-use hayro_syntax::object::dict::keys::{FONT_DESC, FONT_FILE, FONT_FILE3, TO_UNICODE};
+use hayro_syntax::object::dict::keys::{FONT_DESC, FONT_FILE, FONT_FILE3};
 use kurbo::{Affine, BezPath};
 use log::warn;
 use skrifa::GlyphId;
